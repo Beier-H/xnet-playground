@@ -1,168 +1,433 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Activation = "cauchy" | "relu" | "tanh";
-type Target = "sin" | "exp" | "abs";
+import ApproximationPlot from "./components/ApproximationPlot";
+import LossChart, { HISTORY_LIMIT, type LossPoint } from "./components/LossChart";
+import NetworkDiagram, { type NeuronRef } from "./components/NetworkDiagram";
+import {
+  ACTIVATIONS,
+  BATCH_SIZES,
+  LEARNING_RATES,
+  MAX_LAYERS,
+  MAX_NEURONS,
+  PLOT_XS,
+  REG_RATES,
+  TARGETS,
+  buildNetwork,
+  loss as computeLoss,
+  makeDataset,
+  mulberry32,
+  neuronCurves,
+  networkShape,
+  targetValue,
+  trainEpoch,
+  type Activation,
+  type Network,
+  type Regularization,
+} from "./lib/model";
+import { DEFAULT_CONFIG, readConfig, writeConfig, type PlaygroundConfig } from "./lib/urlState";
 
-type Unit = { w: number; b: number; a: number; l1: number; l2: number; sigmaRaw: number };
+/**
+ * Config keys that invalidate whatever has been trained so far. Learning rate,
+ * regularization and batch size are deliberately absent: those can change
+ * mid-run, which is half the fun.
+ */
+const REBUILD_KEYS = [
+  "shape",
+  "netSeed",
+  "activation",
+  "target",
+  "noise",
+  "percentTrain",
+  "dataSeed",
+] as const satisfies readonly (keyof PlaygroundConfig)[];
 
-const samples = Array.from({ length: 81 }, (_, i) => -1 + (2 * i) / 80);
+export default function Playground() {
+  const [config, setConfig] = useState<PlaygroundConfig>(DEFAULT_CONFIG);
+  const [net, setNet] = useState<Network>(() => buildNetwork(DEFAULT_CONFIG.shape, DEFAULT_CONFIG.netSeed));
+  const [epoch, setEpoch] = useState(0);
+  const [history, setHistory] = useState<LossPoint[]>([]);
+  const [playing, setPlaying] = useState(false);
+  const [hovered, setHovered] = useState<NeuronRef | null>(null);
 
-function targetValue(target: Target, x: number) {
-  if (target === "sin") return Math.sin(Math.PI * x);
-  if (target === "exp") return Math.exp(x) / Math.E;
-  return Math.abs(x);
-}
+  // The live network is mirrored into a ref so the training loop can read it
+  // without re-subscribing the animation frame on every epoch.
+  const netRef = useRef(net);
+  useEffect(() => {
+    netRef.current = net;
+  }, [net]);
+  // A single shuffling stream, kept out of React state so it never triggers a render.
+  const shuffleRng = useRef(mulberry32(7));
 
-function softplus(x: number) { return x > 18 ? x : Math.log1p(Math.exp(x)); }
-function sigmoid(x: number) { return 1 / (1 + Math.exp(-x)); }
+  const {
+    activation,
+    target,
+    shape,
+    learningRate,
+    regularization,
+    regRate,
+    batchSize,
+    noise,
+    percentTrain,
+    dataSeed,
+    showTest,
+  } = config;
 
-function seededUnit(index: number): Unit {
-  const r = Math.sin((index + 1) * 91.27);
-  return {
-    w: 0.55 + r * 0.7,
-    b: Math.sin((index + 3) * 4.7) * 0.4,
-    a: Math.cos((index + 5) * 6.2) * 0.22,
-    l1: Math.sin((index + 9) * 2.4) * 0.35,
-    l2: Math.cos((index + 11) * 3.9) * 0.55,
-    sigmaRaw: -0.2 + Math.sin((index + 2) * 8.1) * 0.25,
-  };
-}
+  // Restore a shared experiment from the URL once, after mount.
+  //
+  // This has to be an effect rather than a lazy initializer: `location.hash`
+  // does not exist during the server render, so seeding state from it directly
+  // would make the hydrating client render disagree with the server HTML. The
+  // set-state-in-effect rule is aimed at cascading renders; here it is a single
+  // batched update that runs exactly once, which is the accepted trade-off for
+  // reading browser-only state under SSR.
+  useEffect(() => {
+    const fromUrl = readConfig(window.location.hash);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setConfig(fromUrl);
+    setNet(buildNetwork(fromUrl.shape, fromUrl.netSeed));
+    setEpoch(0);
+    setHistory([]);
+  }, []);
 
-function makeUnits(width: number) { return Array.from({ length: width }, (_, index) => seededUnit(index)); }
+  useEffect(() => {
+    window.history.replaceState(null, "", writeConfig(config));
+  }, [config]);
 
-function unitValue(unit: Unit, z: number, activation: Activation) {
-  if (activation === "relu") return Math.max(0, z);
-  if (activation === "tanh") return Math.tanh(z);
-  const sigma = softplus(unit.sigmaRaw) + 0.08;
-  return (unit.l1 * z + unit.l2) / (z * z + sigma * sigma);
-}
+  const dataset = useMemo(
+    () => makeDataset(target, noise, percentTrain, dataSeed),
+    [target, noise, percentTrain, dataSeed],
+  );
 
-function predict(units: Unit[], outputBias: number, x: number, activation: Activation) {
-  return outputBias + units.reduce((sum, unit) => sum + unit.a * unitValue(unit, unit.w * x + unit.b, activation), 0);
-}
+  const trainLoss = useMemo(
+    () => computeLoss(net, dataset.train, activation),
+    [net, dataset.train, activation],
+  );
+  const testLoss = useMemo(
+    () => computeLoss(net, dataset.test, activation),
+    [net, dataset.test, activation],
+  );
 
-function mse(units: Unit[], outputBias: number, target: Target, activation: Activation) {
-  return samples.reduce((sum, x) => {
-    const err = predict(units, outputBias, x, activation) - targetValue(target, x);
-    return sum + err * err;
-  }, 0) / samples.length;
-}
+  const restart = useCallback((next: PlaygroundConfig) => {
+    setPlaying(false);
+    setConfig(next);
+    setNet(buildNetwork(next.shape, next.netSeed));
+    setEpoch(0);
+    setHistory([]);
+  }, []);
 
-function SvgPlot({ units, outputBias, target, activation }: { units: Unit[]; outputBias: number; target: Target; activation: Activation }) {
-  const values = samples.flatMap((x) => [targetValue(target, x), predict(units, outputBias, x, activation)]);
-  const yMin = Math.min(-0.2, ...values);
-  const yMax = Math.max(1.05, ...values);
-  const padding = (yMax - yMin) * 0.12;
-  const low = yMin - padding;
-  const high = yMax + padding;
-  const width = 720;
-  const height = 330;
-  const xToSvg = (x: number) => 48 + ((x + 1) / 2) * (width - 68);
-  const yToSvg = (y: number) => 18 + ((high - y) / (high - low)) * (height - 58);
-  const toPath = (fn: (x: number) => number) => samples.map((x, index) => `${index === 0 ? "M" : "L"}${xToSvg(x).toFixed(2)},${yToSvg(fn(x)).toFixed(2)}`).join(" ");
-  const targetPath = toPath((x) => targetValue(target, x));
-  const modelPath = toPath((x) => predict(units, outputBias, x, activation));
-  const yTicks = [low, (low + high) / 2, high];
+  const update = useCallback(
+    (patch: Partial<PlaygroundConfig>) => {
+      const next = { ...config, ...patch };
+      if (REBUILD_KEYS.some((key) => patch[key] !== undefined)) restart(next);
+      else setConfig(next);
+    },
+    [config, restart],
+  );
+
+  const step = useCallback(() => {
+    const next = trainEpoch(
+      netRef.current,
+      dataset.train,
+      { activation, learningRate, batchSize, regularization, regRate },
+      shuffleRng.current,
+    );
+    netRef.current = next;
+    setNet(next);
+    setEpoch((value) => value + 1);
+    setHistory((current) =>
+      [
+        ...current,
+        {
+          train: computeLoss(next, dataset.train, activation),
+          test: computeLoss(next, dataset.test, activation),
+        },
+      ].slice(-HISTORY_LIMIT),
+    );
+  }, [dataset, activation, learningRate, batchSize, regularization, regRate]);
+
+  // Continuous training: one epoch per animation frame while playing.
+  useEffect(() => {
+    if (!playing) return;
+    let frame = 0;
+    const loop = () => {
+      step();
+      frame = requestAnimationFrame(loop);
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, [playing, step]);
+
+  const hoveredCurve = useMemo(() => {
+    if (!hovered) return null;
+    const curves = neuronCurves(net, PLOT_XS, activation);
+    return curves[hovered.layer]?.[hovered.index] ?? null;
+  }, [hovered, net, activation]);
+
+  const hiddenCount = shape.length;
 
   return (
-    <svg className="plot" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Target function and neural-network prediction">
-      <rect x="0" y="0" width={width} height={height} rx="14" className="plot-background" />
-      {[-1, -0.5, 0, 0.5, 1].map((tick) => <g key={tick}><line x1={xToSvg(tick)} x2={xToSvg(tick)} y1="18" y2={height - 40} className="grid" /><text x={xToSvg(tick)} y={height - 18} textAnchor="middle" className="axis-label">{tick}</text></g>)}
-      {yTicks.map((tick, index) => <g key={index}><line x1="48" x2={width - 20} y1={yToSvg(tick)} y2={yToSvg(tick)} className="grid" /><text x="38" y={yToSvg(tick) + 4} textAnchor="end" className="axis-label">{tick.toFixed(1)}</text></g>)}
-      <line x1="48" x2={width - 20} y1={yToSvg(0)} y2={yToSvg(0)} className="zero-line" />
-      <path d={targetPath} className="target-line" /><path d={modelPath} className="model-line" />
-      <g transform={`translate(${width - 182},30)`}><line x1="0" x2="26" y1="0" y2="0" className="target-line" /><text x="34" y="4" className="legend-label">target</text><line x1="0" x2="26" y1="20" y2="20" className="model-line" /><text x="34" y="24" className="legend-label">network</text></g>
-    </svg>
+    <div className="page">
+      <header className="masthead">
+        <p className="eyebrow">Cauchy activation playground</p>
+        <h1>
+          Watch a network learn the <em>shape</em> of its own nonlinearity.
+        </h1>
+        <p className="lede">
+          Fit a 1-D target with Cauchy, ReLU, or tanh units. Cauchy neurons carry learnable
+          shape parameters — φ(z) = (λ₁z + λ₂)/(z² + σ²) — so each one adapts its own curve
+          instead of reusing a fixed kink.
+        </p>
+      </header>
+
+      <section className="control-bar" aria-label="Training controls">
+        <div className="transport">
+          <button
+            type="button"
+            className="icon-button"
+            title="Reset the network"
+            aria-label="Reset the network"
+            onClick={() => restart({ ...config, netSeed: Math.floor(Math.random() * 1e9) })}
+          >
+            ↺
+          </button>
+          <button
+            type="button"
+            className="play-button"
+            aria-label={playing ? "Pause training" : "Start training"}
+            onClick={() => setPlaying((value) => !value)}
+          >
+            {playing ? "❚❚" : "▶"}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            title="Train one epoch"
+            aria-label="Train one epoch"
+            onClick={() => {
+              setPlaying(false);
+              step();
+            }}
+          >
+            ▶❘
+          </button>
+        </div>
+
+        <div className="readout">
+          <span>Epoch</span>
+          <strong>{epoch.toLocaleString("en-US", { minimumIntegerDigits: 6, useGrouping: true })}</strong>
+        </div>
+
+        <label className="field">
+          Learning rate
+          <select
+            value={learningRate}
+            onChange={(event) => update({ learningRate: Number(event.target.value) })}
+          >
+            {LEARNING_RATES.map((rate) => (
+              <option key={rate} value={rate}>
+                {rate}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="field">
+          Activation
+          <select
+            value={activation}
+            onChange={(event) => update({ activation: event.target.value as Activation })}
+          >
+            {ACTIVATIONS.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="field">
+          Regularization
+          <select
+            value={regularization}
+            onChange={(event) =>
+              update({ regularization: event.target.value as Regularization })
+            }
+          >
+            <option value="none">None</option>
+            <option value="l1">L1</option>
+            <option value="l2">L2</option>
+          </select>
+        </label>
+
+        <label className="field">
+          Reg. rate
+          <select
+            value={regRate}
+            disabled={regularization === "none"}
+            onChange={(event) => update({ regRate: Number(event.target.value) })}
+          >
+            {REG_RATES.map((rate) => (
+              <option key={rate} value={rate}>
+                {rate}
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
+
+      <main className="playground">
+        <section className="column" aria-label="Data">
+          <h2>Data</h2>
+          <p className="column-note">Which target should the network fit?</p>
+          <div className="target-grid">
+            {TARGETS.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`target-chip ${target === item.id ? "selected" : ""}`}
+                onClick={() => update({ target: item.id })}
+                title={item.note}
+              >
+                <svg viewBox="0 0 60 34" aria-hidden="true">
+                  <polyline
+                    points={PLOT_XS.filter((_, i) => i % 4 === 0)
+                      .map((x, i, arr) => {
+                        const y = targetValue(item.id, x);
+                        return `${((i / (arr.length - 1)) * 56 + 2).toFixed(1)},${(17 - y * 12).toFixed(1)}`;
+                      })
+                      .join(" ")}
+                  />
+                </svg>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+
+          <label className="slider">
+            Ratio of training to test data: <strong>{percentTrain}%</strong>
+            <input
+              type="range"
+              min="10"
+              max="90"
+              step="10"
+              value={percentTrain}
+              onChange={(event) => update({ percentTrain: Number(event.target.value) })}
+            />
+          </label>
+          <label className="slider">
+            Noise: <strong>{noise.toFixed(2)}</strong>
+            <input
+              type="range"
+              min="0"
+              max="0.5"
+              step="0.05"
+              value={noise}
+              onChange={(event) => update({ noise: Number(event.target.value) })}
+            />
+          </label>
+          <label className="slider">
+            Batch size: <strong>{batchSize}</strong>
+            <input
+              type="range"
+              min="0"
+              max={BATCH_SIZES.length - 1}
+              step="1"
+              value={BATCH_SIZES.indexOf(batchSize)}
+              onChange={(event) => update({ batchSize: BATCH_SIZES[Number(event.target.value)] })}
+            />
+          </label>
+          <button
+            type="button"
+            className="wide-button"
+            onClick={() => update({ dataSeed: Math.floor(Math.random() * 1e9) })}
+          >
+            Regenerate
+          </button>
+        </section>
+
+        <section className="column column-network" aria-label="Network">
+          <h2>Network</h2>
+          <NetworkDiagram
+            net={net}
+            activation={activation}
+            hovered={hovered}
+            onHover={setHovered}
+            onAddLayer={() =>
+              hiddenCount < MAX_LAYERS && update({ shape: [...shape, 3] })
+            }
+            onRemoveLayer={() => hiddenCount > 0 && update({ shape: shape.slice(0, -1) })}
+            onAddNeuron={(layer) => {
+              if (shape[layer] >= MAX_NEURONS) return;
+              const next = [...shape];
+              next[layer] += 1;
+              update({ shape: next });
+            }}
+            onRemoveNeuron={(layer) => {
+              if (shape[layer] <= 1) return;
+              const next = [...shape];
+              next[layer] -= 1;
+              update({ shape: next });
+            }}
+          />
+        </section>
+
+        <section className="column column-output" aria-label="Output">
+          <h2>Output</h2>
+          <div className="loss-readout">
+            <div>
+              <span>Test loss</span>
+              <strong className="loss-test-value">{testLoss.toFixed(4)}</strong>
+            </div>
+            <div>
+              <span>Training loss</span>
+              <strong className="loss-train-value">{trainLoss.toFixed(4)}</strong>
+            </div>
+          </div>
+          <LossChart history={history} />
+
+          <ApproximationPlot
+            net={net}
+            activation={activation}
+            target={target}
+            train={dataset.train}
+            test={dataset.test}
+            showTest={showTest}
+            hoveredCurve={hoveredCurve}
+          />
+
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={showTest}
+              onChange={(event) => setConfig((c) => ({ ...c, showTest: event.target.checked }))}
+            />
+            Show test data
+          </label>
+        </section>
+      </main>
+
+      <footer className="formula-strip">
+        <div>
+          <span>Neuron input</span>
+          <strong>z = wᵀa + b</strong>
+        </div>
+        <div>
+          <span>Cauchy activation</span>
+          <strong>φ(z) = (λ₁z + λ₂)/(z² + σ²)</strong>
+        </div>
+        <div>
+          <span>Learned per neuron</span>
+          <strong>{activation === "cauchy" ? "w, b, λ₁, λ₂, σ" : "w, b only"}</strong>
+        </div>
+        <div>
+          <span>Network</span>
+          <strong>
+            {networkShape(net).join(" → ") || "no hidden layer"} → 1
+          </strong>
+        </div>
+      </footer>
+    </div>
   );
-}
-
-export default function Home() {
-  const [activation, setActivation] = useState<Activation>("cauchy");
-  const [target, setTarget] = useState<Target>("sin");
-  const [width, setWidth] = useState(8);
-  const [learningRate, setLearningRate] = useState(0.035);
-  const [units, setUnits] = useState<Unit[]>(() => makeUnits(8));
-  const [outputBias, setOutputBias] = useState(0);
-  const [epoch, setEpoch] = useState(0);
-  const [lossHistory, setLossHistory] = useState<number[]>([mse(makeUnits(8), 0, "sin", "cauchy")]);
-  const loss = useMemo(() => mse(units, outputBias, target, activation), [units, outputBias, target, activation]);
-
-  function reset(nextWidth = width, nextTarget = target, nextActivation = activation) {
-    const fresh = makeUnits(nextWidth);
-    setUnits(fresh); setOutputBias(0); setEpoch(0); setLossHistory([mse(fresh, 0, nextTarget, nextActivation)]);
-  }
-  function updateWidth(nextWidth: number) { setWidth(nextWidth); reset(nextWidth); }
-  function changeTarget(nextTarget: Target) { setTarget(nextTarget); reset(width, nextTarget, activation); }
-  function changeActivation(nextActivation: Activation) { setActivation(nextActivation); reset(width, target, nextActivation); }
-
-  function train(iterations = 200) {
-    let nextUnits = units.map((unit) => ({ ...unit }));
-    let nextBias = outputBias;
-    const nextHistory = [...lossHistory];
-    for (let step = 0; step < iterations; step += 1) {
-      const gradients = nextUnits.map(() => ({ w: 0, b: 0, a: 0, l1: 0, l2: 0, sigmaRaw: 0 }));
-      let biasGradient = 0;
-      for (const x of samples) {
-        const hidden = nextUnits.map((unit) => { const z = unit.w * x + unit.b; return { z, value: unitValue(unit, z, activation) }; });
-        const output = nextBias + hidden.reduce((sum, item, index) => sum + nextUnits[index].a * item.value, 0);
-        const dLossOutput = (2 * (output - targetValue(target, x))) / samples.length;
-        biasGradient += dLossOutput;
-        nextUnits.forEach((unit, index) => {
-          const { z, value } = hidden[index];
-          gradients[index].a += dLossOutput * value;
-          const dLossValue = dLossOutput * unit.a;
-          let dValueZ = 0;
-          if (activation === "relu") dValueZ = z > 0 ? 1 : 0;
-          else if (activation === "tanh") dValueZ = 1 - value * value;
-          else {
-            const sigma = softplus(unit.sigmaRaw) + 0.08;
-            const denominator = z * z + sigma * sigma;
-            const numerator = unit.l1 * z + unit.l2;
-            dValueZ = (unit.l1 * denominator - 2 * z * numerator) / (denominator * denominator);
-            gradients[index].l1 += dLossValue * z / denominator;
-            gradients[index].l2 += dLossValue / denominator;
-            gradients[index].sigmaRaw += dLossValue * (-2 * sigma * numerator) / (denominator * denominator) * sigmoid(unit.sigmaRaw);
-          }
-          const dLossZ = dLossValue * dValueZ;
-          gradients[index].w += dLossZ * x; gradients[index].b += dLossZ;
-        });
-      }
-      nextUnits = nextUnits.map((unit, index) => ({
-        w: unit.w - learningRate * gradients[index].w,
-        b: unit.b - learningRate * gradients[index].b,
-        a: unit.a - learningRate * gradients[index].a,
-        l1: unit.l1 - learningRate * gradients[index].l1,
-        l2: unit.l2 - learningRate * gradients[index].l2,
-        sigmaRaw: Math.max(-6, Math.min(5, unit.sigmaRaw - learningRate * gradients[index].sigmaRaw)),
-      }));
-      nextBias -= learningRate * biasGradient;
-      if ((step + 1) % 20 === 0) nextHistory.push(mse(nextUnits, nextBias, target, activation));
-    }
-    setUnits(nextUnits); setOutputBias(nextBias); setEpoch((value) => value + iterations); setLossHistory(nextHistory.slice(-32));
-  }
-
-  const recentLoss = lossHistory.at(-1) ?? loss;
-  const maxLoss = Math.max(...lossHistory, recentLoss, 0.0001);
-  const lossPoints = lossHistory.map((item, index) => {
-    const x = lossHistory.length === 1 ? 0 : (index / (lossHistory.length - 1)) * 100;
-    const y = 100 - (Math.log1p(item) / Math.log1p(maxLoss)) * 88;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-
-  return <main className="lab-shell">
-    <section className="hero"><p className="eyebrow">Cauchy activation research lab</p><h1>Compare function approximation, one neuron family at a time.</h1><p>Fit the same one-dimensional target with Cauchy, ReLU, or tanh units. The curves make width, training loss, and approximation error visible.</p></section>
-    <section className="control-panel" aria-label="Experiment controls">
-      <label>Target function<select value={target} onChange={(event) => changeTarget(event.target.value as Target)}><option value="sin">sin(πx) — analytic</option><option value="exp">eˣ / e — analytic</option><option value="abs">|x| — non-analytic at 0</option></select></label>
-      <label>Activation<select value={activation} onChange={(event) => changeActivation(event.target.value as Activation)}><option value="cauchy">Cauchy</option><option value="relu">ReLU</option><option value="tanh">tanh</option></select></label>
-      <label>Hidden neurons <strong>{width}</strong><input type="range" min="2" max="24" step="1" value={width} onChange={(event) => updateWidth(Number(event.target.value))} /></label>
-      <label>Learning rate <strong>{learningRate.toFixed(3)}</strong><input type="range" min="0.005" max="0.08" step="0.005" value={learningRate} onChange={(event) => setLearningRate(Number(event.target.value))} /></label>
-      <div className="actions"><button className="primary" onClick={() => train(200)}>Train 200 steps</button><button onClick={() => reset()}>Reset</button></div>
-    </section>
-    <section className="workspace"><div className="plot-card"><div className="card-heading"><div><p className="eyebrow">Approximation</p><h2>Target vs. learned network</h2></div><div className="metric"><span>current MSE</span><strong>{loss.toExponential(2)}</strong></div></div><SvgPlot units={units} outputBias={outputBias} target={target} activation={activation} /></div>
-      <aside className="side-panel"><div className="metric-card"><span>Training epoch</span><strong>{epoch.toLocaleString()}</strong><small>Each click runs 200 full-batch gradient updates.</small></div><div className="metric-card"><span>Model</span><strong>{width} hidden units</strong><small>{activation === "cauchy" ? "Each unit learns its Cauchy shape parameters." : "The activation shape is fixed."}</small></div><div className="loss-card"><span>Loss history</span><svg viewBox="0 0 100 100" role="img" aria-label="Recent training loss history"><polyline points={lossPoints} className="loss-line" /></svg><small>latest: {recentLoss.toExponential(2)}</small></div></aside>
-    </section>
-    <section className="formula-strip"><div><span>Neuron input</span><strong>z = wᵀx + b</strong></div><div><span>Cauchy activation</span><strong>φ(z) = (λ₁z + λ₂)/(z² + σ²)</strong></div><div><span>Network output</span><strong>F(x) = Σ aⱼφⱼ(wⱼᵀx + bⱼ) + c</strong></div></section>
-  </main>;
 }
