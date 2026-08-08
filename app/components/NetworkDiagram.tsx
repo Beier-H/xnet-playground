@@ -1,20 +1,30 @@
 "use client";
 
-import { MAX_LAYERS, MAX_NEURONS, neuronCurves, type Activation, type Network } from "../lib/model";
+import type { ActivationId } from "../lib/activations";
+import { MAX_LAYERS, MAX_NEURONS, neuronCurves, type Network } from "../lib/model";
 
 export type NeuronRef = { layer: number; index: number };
 
 const THUMB_XS = Array.from({ length: 25 }, (_, i) => -1 + (2 * i) / 24);
 
-const NODE = 46;
-const ROW = 66;
-const COL_MIN = 108;
+const NODE = 44;
+const ROW = 62;
+const COL_MIN = 104;
+
+/**
+ * Output magnitude that fills most of a thumbnail before saturating. Low enough
+ * that a quiet neuron early in training is still legible, high enough that a
+ * unit doing real work has not yet saturated.
+ */
+const THUMB_SCALE = 0.6;
 
 type Props = {
   net: Network;
-  activation: Activation;
+  activation: ActivationId;
   hovered: NeuronRef | null;
+  selected: NeuronRef | null;
   onHover: (ref: NeuronRef | null) => void;
+  onSelect: (ref: NeuronRef | null) => void;
   onAddLayer: () => void;
   onRemoveLayer: () => void;
   onAddNeuron: (layer: number) => void;
@@ -27,22 +37,13 @@ function edgeWidth(w: number): number {
 }
 
 /**
- * Output magnitude that fills most of a thumbnail before saturating. Low enough
- * that a quiet neuron early in training is still legible, high enough that a
- * unit doing real work has not yet saturated.
- */
-const THUMB_SCALE = 0.6;
-
-/**
  * Draws a neuron's response on a *fixed* vertical scale.
  *
- * Auto-ranging each box to its own min/max is tempting but unusable while
- * training: every box is stretched to full height regardless of amplitude, so
- * a neuron that barely moves still renders full-height and the tiniest change
- * makes the curve leap across the box on the next frame. A fixed squash keeps
- * the drawing still unless the neuron's output genuinely moves, and lets you
- * compare amplitudes across neurons. tanh rather than a hard clamp so large
- * Cauchy spikes saturate smoothly instead of clipping flat.
+ * Auto-ranging each box to its own min/max is unusable while training: every
+ * box would be stretched to full height regardless of amplitude, so a neuron
+ * that barely moves still renders full-height and the tiniest change makes the
+ * curve leap across the box on the next frame. tanh rather than a hard clamp so
+ * large Cauchy spikes saturate smoothly instead of clipping flat.
  */
 function polyline(values: number[], width: number, height: number): string {
   const pad = 5;
@@ -61,24 +62,26 @@ export default function NetworkDiagram({
   net,
   activation,
   hovered,
+  selected,
   onHover,
+  onSelect,
   onAddLayer,
   onRemoveLayer,
   onAddNeuron,
   onRemoveNeuron,
 }: Props) {
   const hiddenLayers = net.slice(0, -1);
-  const columns = hiddenLayers.length + 2; // input + hidden + output
+  const columns = hiddenLayers.length + 2;
   const tallest = Math.max(1, ...hiddenLayers.map((layer) => layer.length));
-  const width = Math.max(COL_MIN * columns, 420);
-  const height = Math.max(tallest, 3) * ROW + 30;
+  const width = Math.max(COL_MIN * columns, 400);
+  const height = Math.max(tallest, 3) * ROW + 26;
   const curves = neuronCurves(net, THUMB_XS, activation);
 
-  const colX = (col: number) => ((col + 0.5) * width) / columns;
-  const rowY = (index: number, count: number) =>
-    height / 2 + (index - (count - 1) / 2) * ROW;
+  // Whichever neuron the detail panel is currently describing.
+  const focus = hovered ?? selected;
 
-  // Column index of each layer in `net`: hidden layers first, then the output.
+  const colX = (col: number) => ((col + 0.5) * width) / columns;
+  const rowY = (index: number, count: number) => height / 2 + (index - (count - 1) / 2) * ROW;
   const layerColumn = (l: number) => l + 1;
 
   return (
@@ -107,9 +110,7 @@ export default function NetworkDiagram({
                 −
               </button>
             </div>
-            <span className="layer-caption">
-              {layer.length} neuron{layer.length === 1 ? "" : "s"}
-            </span>
+            <span className="layer-caption">{layer.length}</span>
           </div>
         ))}
         <div className="layer-cell">
@@ -123,7 +124,6 @@ export default function NetworkDiagram({
         role="img"
         aria-label="Network architecture with per-neuron response curves"
       >
-        {/* Edges are drawn first so the node boxes sit on top of them. */}
         {net.map((layer, l) =>
           layer.map((neuron, j) =>
             neuron.w.map((w, i) => {
@@ -133,26 +133,25 @@ export default function NetworkDiagram({
               const y1 = rowY(i, fromCount);
               const y2 = rowY(j, layer.length);
               const mid = (fromCol + toCol) / 2;
-              // Highlight the edges entering and leaving the hovered neuron.
+              // Highlight the edges entering and leaving the focused neuron.
               const related =
-                hovered !== null &&
-                ((hovered.layer === l && hovered.index === j) ||
-                  (hovered.layer === l - 1 && hovered.index === i));
-              const dim = hovered !== null && !related;
+                focus !== null &&
+                ((focus.layer === l && focus.index === j) ||
+                  (focus.layer === l - 1 && focus.index === i));
+              const dim = focus !== null && !related;
               return (
                 <path
                   key={`${l}-${j}-${i}`}
                   d={`M${fromCol + NODE / 2},${y1} C${mid},${y1} ${mid},${y2} ${toCol - NODE / 2},${y2}`}
                   className={`edge ${w >= 0 ? "edge-pos" : "edge-neg"}`}
                   strokeWidth={edgeWidth(w)}
-                  opacity={dim ? 0.18 : 0.75}
+                  opacity={dim ? 0.15 : 0.75}
                 />
               );
             }),
           ),
         )}
 
-        {/* Input node */}
         <g>
           <rect
             x={colX(0) - NODE / 2}
@@ -167,17 +166,18 @@ export default function NetworkDiagram({
           </text>
         </g>
 
-        {/* Hidden neurons, each showing its own response curve over x ∈ [−1, 1] */}
         {hiddenLayers.map((layer, l) =>
           layer.map((neuron, j) => {
             const cx = colX(layerColumn(l));
             const cy = rowY(j, layer.length);
-            const isHovered = hovered?.layer === l && hovered.index === j;
+            const isFocus = focus?.layer === l && focus.index === j;
+            const isPinned = selected?.layer === l && selected.index === j;
             return (
               <g
                 key={`n-${l}-${j}`}
                 onMouseEnter={() => onHover({ layer: l, index: j })}
                 onMouseLeave={() => onHover(null)}
+                onClick={() => onSelect(isPinned ? null : { layer: l, index: j })}
                 className="node-group"
               >
                 <rect
@@ -186,7 +186,7 @@ export default function NetworkDiagram({
                   width={NODE}
                   height={NODE}
                   rx="7"
-                  className={`node ${isHovered ? "node-active" : ""}`}
+                  className={`node ${isFocus ? "node-active" : ""} ${isPinned ? "node-pinned" : ""}`}
                 />
                 <polyline
                   points={polyline(curves[l][j], NODE, NODE)}
@@ -198,7 +198,6 @@ export default function NetworkDiagram({
           }),
         )}
 
-        {/* Output node */}
         <g>
           <rect
             x={colX(columns - 1) - NODE / 2}
@@ -208,23 +207,11 @@ export default function NetworkDiagram({
             rx="7"
             className="node node-io"
           />
-          <text
-            x={colX(columns - 1)}
-            y={rowY(0, 1) + 6}
-            textAnchor="middle"
-            className="node-label"
-          >
+          <text x={colX(columns - 1)} y={rowY(0, 1) + 6} textAnchor="middle" className="node-label">
             F
           </text>
         </g>
       </svg>
-
-      <p className="network-hint">
-        Each box plots that neuron&rsquo;s own output across x. Line thickness is weight
-        magnitude; <span className="swatch-pos">orange</span> is positive,{" "}
-        <span className="swatch-neg">blue</span> negative. Hover a neuron to trace it in the
-        approximation plot.
-      </p>
 
       <div className="layer-controls">
         <button type="button" onClick={onRemoveLayer} disabled={hiddenLayers.length === 0}>

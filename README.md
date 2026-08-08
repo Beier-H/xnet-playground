@@ -5,41 +5,81 @@ An interactive lab, in the spirit of
 activation function**:
 
 ```
-φ(z) = (λ₁z + λ₂) / (z² + σ²)
+φ(x) = (λ₁x + λ₂) / (x² + d²)
 ```
 
 Unlike ReLU or tanh, whose shape is fixed, every Cauchy unit carries its own
-learnable `λ₁, λ₂, σ`, so each neuron adapts the shape of its nonlinearity
-during training. The playground fits a 1-D target with Cauchy, ReLU, or tanh
-units side by side, so the difference is visible rather than asserted.
+learnable `λ₁, λ₂, d`, so each neuron adapts the shape of its nonlinearity
+during training. The playground puts that side by side with fixed-shape
+activations so the difference is visible rather than asserted.
+
+## Two modes
+
+**Function Approximation** fits a 1-D target. **PDE Demo** solves a small
+PINN problem. Both compare Cauchy against fixed-shape activations under
+identical conditions.
 
 ## What you can do
 
 - **Train continuously** — play/pause runs one epoch per animation frame; step
   runs a single epoch.
-- **Edit the architecture live** — up to 4 hidden layers of up to 8 neurons.
-- **See inside the network** — every neuron box plots its own response across
-  x; edge thickness is weight magnitude, orange positive, blue negative. Hover
-  a neuron to trace its curve on the approximation plot.
-- **Change the problem** — four targets (smooth, monotone, kinked, and
-  discontinuous), adjustable noise, train/test split, and batch size.
-- **Regularize** — L1 or L2, to watch a wide net stop chasing noise.
-- **Share an experiment** — the full configuration lives in the URL hash, so a
-  link reproduces the exact setup.
+- **Pick an activation** — Cauchy, ReLU and Tanh are the primary comparison and
+  sit on segmented buttons; Sigmoid, GELU, SiLU/Swish and Sine are in the
+  dropdown.
+- **Shape the Cauchy neuron** — λ₁, λ₂ and d sliders set the initialization and
+  redraw the activation chart live. Training then adapts them per neuron.
+- **See the activation itself** — a small chart plots φ(z), optionally with
+  φ′(z), making the localization and smoothness explicit.
+- **Compare activations** — trains Cauchy, ReLU and Tanh on the *same*
+  architecture, dataset, seed, optimizer, learning rate and mini-batch order,
+  and overlays their loss curves and fits.
+- **Measure the trade-off** — train loss, test loss, function MSE against the
+  noiseless target, epochs to reach a target error, runtime, and trainable
+  parameter count.
+- **Inspect a neuron** — hover or click to pin one and see its learned λ₁, λ₂,
+  d, its own response curve, its contribution to the output (measured by
+  ablation), and the x-band where it matters most.
+- **Change the problem** — six targets including the Heaviside step (the XNet
+  benchmark), sin(10πx) and the Runge function; discrete noise levels 0 / 0.05
+  / 0.10 / 0.20; train/test split; batch size; L1 or L2 regularization.
+- **Share an experiment** — the full configuration lives in the URL hash.
 
 ## Code layout
 
 | Path | Role |
 | --- | --- |
-| `app/lib/model.ts` | Dataset, network, forward pass, analytic gradients, SGD |
+| `app/lib/activations.ts` | 7 activations with analytic φ, φ′, φ″ and shape gradients |
+| `app/lib/model.ts` | Dataset, network, forward pass, analytic backprop, SGD |
+| `app/lib/pde.ts` | PINN prototype: residuals, collocation, Adam |
+| `app/lib/paperBenchmarks.ts` | Published reference figures (see below) |
 | `app/lib/urlState.ts` | Config ⇄ URL hash, with validation of every field |
-| `app/components/NetworkDiagram.tsx` | Architecture, weights, per-neuron curves |
-| `app/components/ApproximationPlot.tsx` | Target, samples, and model output |
-| `app/components/LossChart.tsx` | Train/test loss on a fixed log scale |
+| `app/components/` | Diagram, plots, activation chart, inspector, metrics, PDE |
 | `app/page.tsx` | State, the training loop, and the control surface |
 
 Backpropagation is written by hand — there is no ML dependency — including the
-analytic gradients for the Cauchy shape parameters.
+analytic gradients for the Cauchy shape parameters. Every derivative is
+verified against central differences (φ′ to ~5e-7, φ″ to ~4e-6, full backprop
+to ~9e-8 relative).
+
+## Paper benchmarks
+
+`app/lib/paperBenchmarks.ts` is **intentionally empty**. The panel renders each
+row as "not supplied" until real reported figures are added, because populating
+a "Paper Result" table with invented numbers would be a fabricated citation.
+Add the values and a citation there and the panel fills in.
+
+## The PDE demo is a prototype
+
+One hidden layer of 6 units, identical seed and optimizer across activations.
+The residual uses analytic φ″; parameter gradients are central finite
+differences with Adam. Each problem has a closed-form solution, so absolute
+error is real rather than a comparison against another approximation. ReLU has
+φ″ = 0 and therefore cannot represent a second-order operator at all — that is
+a property of the activation, not a bug.
+
+Results are genuinely mixed, and the UI is built to show that rather than to
+argue a conclusion: Cauchy wins clearly on the heat equation and on the
+Heaviside step, while Tanh wins on Poisson with fewer parameters.
 
 ### Two things worth knowing
 

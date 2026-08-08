@@ -2,27 +2,41 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import ApproximationPlot from "./components/ApproximationPlot";
-import LossChart, { HISTORY_LIMIT, type LossPoint } from "./components/LossChart";
+import ActivationShapeChart from "./components/ActivationShapeChart";
+import ApproximationPlot, { type PlotRun } from "./components/ApproximationPlot";
+import LossChart, { HISTORY_LIMIT, type LossPoint, type LossSeries } from "./components/LossChart";
+import MetricsPanel, { type RunMetrics } from "./components/MetricsPanel";
 import NetworkDiagram, { type NeuronRef } from "./components/NetworkDiagram";
+import NeuronInspector from "./components/NeuronInspector";
+import PaperBenchmarks from "./components/PaperBenchmarks";
+import PdeDemo from "./components/PdeDemo";
 import {
   ACTIVATIONS,
+  ACTIVATION_COLORS,
+  activationMeta,
+  type ActivationId,
+} from "./lib/activations";
+import {
   BATCH_SIZES,
+  COMPARE_SET,
+  ERROR_TARGETS,
   LEARNING_RATES,
   MAX_LAYERS,
   MAX_NEURONS,
+  NOISE_LEVELS,
   PLOT_XS,
   REG_RATES,
   TARGETS,
   buildNetwork,
+  functionMse,
   loss as computeLoss,
   makeDataset,
   mulberry32,
-  neuronCurves,
-  networkShape,
+  neuronContribution,
+  parameterCount,
+  shuffledOrder,
   targetValue,
   trainEpoch,
-  type Activation,
   type Network,
   type Regularization,
 } from "./lib/model";
@@ -41,26 +55,61 @@ const REBUILD_KEYS = [
   "noise",
   "percentTrain",
   "dataSeed",
+  "compare",
+  "l1",
+  "l2",
+  "d",
 ] as const satisfies readonly (keyof PlaygroundConfig)[];
+
+type Run = {
+  activation: ActivationId;
+  net: Network;
+  history: LossPoint[];
+  epochsToTarget: number | null;
+  runtimeMs: number;
+};
+
+function activationsFor(config: PlaygroundConfig): ActivationId[] {
+  return config.compare ? COMPARE_SET : [config.activation];
+}
+
+function buildRuns(config: PlaygroundConfig): Run[] {
+  return activationsFor(config).map((activation) => ({
+    activation,
+    // Identical shape and seed across activations, so a comparison is fair.
+    net: buildNetwork(config.shape, config.netSeed, {
+      l1: config.l1,
+      l2: config.l2,
+      d: config.d,
+    }),
+    history: [],
+    epochsToTarget: null,
+    runtimeMs: 0,
+  }));
+}
 
 export default function Playground() {
   const [config, setConfig] = useState<PlaygroundConfig>(DEFAULT_CONFIG);
-  const [net, setNet] = useState<Network>(() => buildNetwork(DEFAULT_CONFIG.shape, DEFAULT_CONFIG.netSeed));
+  const [runs, setRuns] = useState<Run[]>(() => buildRuns(DEFAULT_CONFIG));
   const [epoch, setEpoch] = useState(0);
-  const [history, setHistory] = useState<LossPoint[]>([]);
   const [playing, setPlaying] = useState(false);
   const [hovered, setHovered] = useState<NeuronRef | null>(null);
+  const [selected, setSelected] = useState<NeuronRef | null>(null);
+  const [focusActivation, setFocusActivation] = useState<ActivationId>("cauchy");
 
-  // The live network is mirrored into a ref so the training loop can read it
-  // without re-subscribing the animation frame on every epoch.
-  const netRef = useRef(net);
+  const runsRef = useRef(runs);
   useEffect(() => {
-    netRef.current = net;
-  }, [net]);
-  // A single shuffling stream, kept out of React state so it never triggers a render.
+    runsRef.current = runs;
+  }, [runs]);
+  const epochRef = useRef(0);
+  useEffect(() => {
+    epochRef.current = epoch;
+  }, [epoch]);
   const shuffleRng = useRef(mulberry32(7));
 
   const {
+    mode,
+    compare,
     activation,
     target,
     shape,
@@ -72,23 +121,19 @@ export default function Playground() {
     percentTrain,
     dataSeed,
     showTest,
+    errorTarget,
+    showDerivative,
   } = config;
 
-  // Restore a shared experiment from the URL once, after mount.
-  //
-  // This has to be an effect rather than a lazy initializer: `location.hash`
-  // does not exist during the server render, so seeding state from it directly
-  // would make the hydrating client render disagree with the server HTML. The
-  // set-state-in-effect rule is aimed at cascading renders; here it is a single
-  // batched update that runs exactly once, which is the accepted trade-off for
-  // reading browser-only state under SSR.
+  // Restore a shared experiment from the URL once, after mount. This has to be
+  // an effect: `location.hash` does not exist during the server render, so
+  // seeding state from it directly would break hydration.
   useEffect(() => {
     const fromUrl = readConfig(window.location.hash);
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setConfig(fromUrl);
-    setNet(buildNetwork(fromUrl.shape, fromUrl.netSeed));
+    setRuns(buildRuns(fromUrl));
     setEpoch(0);
-    setHistory([]);
   }, []);
 
   useEffect(() => {
@@ -100,21 +145,12 @@ export default function Playground() {
     [target, noise, percentTrain, dataSeed],
   );
 
-  const trainLoss = useMemo(
-    () => computeLoss(net, dataset.train, activation),
-    [net, dataset.train, activation],
-  );
-  const testLoss = useMemo(
-    () => computeLoss(net, dataset.test, activation),
-    [net, dataset.test, activation],
-  );
-
   const restart = useCallback((next: PlaygroundConfig) => {
     setPlaying(false);
     setConfig(next);
-    setNet(buildNetwork(next.shape, next.netSeed));
+    setRuns(buildRuns(next));
     setEpoch(0);
-    setHistory([]);
+    setSelected(null);
   }, []);
 
   const update = useCallback(
@@ -127,29 +163,53 @@ export default function Playground() {
   );
 
   const step = useCallback(() => {
-    const next = trainEpoch(
-      netRef.current,
-      dataset.train,
-      { activation, learningRate, batchSize, regularization, regRate },
-      shuffleRng.current,
-    );
-    netRef.current = next;
-    setNet(next);
-    setEpoch((value) => value + 1);
-    setHistory((current) =>
-      [
-        ...current,
-        {
-          train: computeLoss(next, dataset.train, activation),
-          test: computeLoss(next, dataset.test, activation),
-        },
-      ].slice(-HISTORY_LIMIT),
-    );
-  }, [dataset, activation, learningRate, batchSize, regularization, regRate]);
+    // Read the counter from a ref rather than state: taking `epoch` as a
+    // dependency would rebuild `step` every epoch, which would tear down and
+    // re-subscribe the animation frame on every single frame.
+    const nextEpoch = epochRef.current + 1;
+    epochRef.current = nextEpoch;
+    // One shared visiting order, so every activation sees identical batches.
+    const order = shuffledOrder(dataset.train.length, shuffleRng.current);
 
-  // Continuous training: one epoch per animation frame while playing.
+    const next = runsRef.current.map((run) => {
+      const started = performance.now();
+      const net = trainEpoch(
+        run.net,
+        dataset.train,
+        {
+          activation: run.activation,
+          learningRate,
+          batchSize,
+          regularization,
+          regRate,
+        },
+        order,
+      );
+      const elapsed = performance.now() - started;
+      const fnMse = functionMse(net, run.activation, target);
+      return {
+        ...run,
+        net,
+        runtimeMs: run.runtimeMs + elapsed,
+        epochsToTarget:
+          run.epochsToTarget === null && fnMse <= errorTarget ? nextEpoch : run.epochsToTarget,
+        history: [
+          ...run.history,
+          {
+            train: computeLoss(net, dataset.train, run.activation),
+            test: computeLoss(net, dataset.test, run.activation),
+          },
+        ].slice(-HISTORY_LIMIT),
+      };
+    });
+
+    runsRef.current = next;
+    setRuns(next);
+    setEpoch(nextEpoch);
+  }, [dataset, learningRate, batchSize, regularization, regRate, target, errorTarget]);
+
   useEffect(() => {
-    if (!playing) return;
+    if (!playing || mode !== "fit") return;
     let frame = 0;
     const loop = () => {
       step();
@@ -157,29 +217,84 @@ export default function Playground() {
     };
     frame = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frame);
-  }, [playing, step]);
+  }, [playing, step, mode]);
 
-  const hoveredCurve = useMemo(() => {
-    if (!hovered) return null;
-    const curves = neuronCurves(net, PLOT_XS, activation);
-    return curves[hovered.layer]?.[hovered.index] ?? null;
-  }, [hovered, net, activation]);
+  // ------------------------------------------------------------- derived data
 
-  const hiddenCount = shape.length;
+  const focusRun = useMemo(
+    () => runs.find((r) => r.activation === focusActivation) ?? runs[0],
+    [runs, focusActivation],
+  );
+
+  const focusNeuron = hovered ?? selected;
+
+  const contribution = useMemo(() => {
+    if (!focusNeuron || !focusRun) return null;
+    if (focusNeuron.layer >= focusRun.net.length - 1) return null;
+    if (focusNeuron.index >= focusRun.net[focusNeuron.layer].length) return null;
+    return neuronContribution(
+      focusRun.net,
+      PLOT_XS,
+      focusRun.activation,
+      focusNeuron.layer,
+      focusNeuron.index,
+    );
+  }, [focusNeuron, focusRun]);
+
+  const metrics: RunMetrics[] = runs.map((run) => ({
+    activation: run.activation,
+    trainLoss: computeLoss(run.net, dataset.train, run.activation),
+    testLoss: computeLoss(run.net, dataset.test, run.activation),
+    functionMse: functionMse(run.net, run.activation, target),
+    epochsToTarget: run.epochsToTarget,
+    runtimeMs: run.runtimeMs,
+    params: parameterCount(shape, run.activation),
+  }));
+
+  const plotRuns: PlotRun[] = runs.map((run) => ({
+    activation: run.activation,
+    net: run.net,
+    color: ACTIVATION_COLORS[run.activation],
+  }));
+
+  const lossSeries: LossSeries[] = compare
+    ? runs.map((run) => ({
+        id: run.activation,
+        color: ACTIVATION_COLORS[run.activation],
+        values: run.history.map((h) => h.train),
+      }))
+    : [
+        { id: "test", color: "#2b4257", values: runs[0]?.history.map((h) => h.test) ?? [], dashed: true },
+        {
+          id: "train",
+          color: ACTIVATION_COLORS[runs[0]?.activation ?? "cauchy"],
+          values: runs[0]?.history.map((h) => h.train) ?? [],
+        },
+      ];
+
+  const primary = ACTIVATIONS.filter((a) => a.primary);
+  const secondary = ACTIVATIONS.filter((a) => !a.primary);
+  const cauchyVisible = compare || activation === "cauchy";
+  const shapeParams = { l1: config.l1, l2: config.l2, d: config.d };
+
+  if (mode === "pde") {
+    return (
+      <div className="page">
+        <Masthead mode={mode} onMode={(m) => update({ mode: m })} />
+        <PdeDemo
+          pde={config.pde}
+          learningRate={config.pdeLearningRate}
+          onChangePde={(id) => setConfig({ ...config, pde: id })}
+          onChangeLearningRate={(lr) => setConfig({ ...config, pdeLearningRate: lr })}
+        />
+        <PaperBenchmarks />
+      </div>
+    );
+  }
 
   return (
     <div className="page">
-      <header className="masthead">
-        <p className="eyebrow">Cauchy activation playground</p>
-        <h1>
-          Watch a network learn the <em>shape</em> of its own nonlinearity.
-        </h1>
-        <p className="lede">
-          Fit a 1-D target with Cauchy, ReLU, or tanh units. Cauchy neurons carry learnable
-          shape parameters — φ(z) = (λ₁z + λ₂)/(z² + σ²) — so each one adapts its own curve
-          instead of reusing a fixed kink.
-        </p>
-      </header>
+      <Masthead mode={mode} onMode={(m) => update({ mode: m })} />
 
       <section className="control-bar" aria-label="Training controls">
         <div className="transport">
@@ -219,12 +334,54 @@ export default function Playground() {
           <strong>{epoch.toLocaleString("en-US", { minimumIntegerDigits: 6, useGrouping: true })}</strong>
         </div>
 
+        <div className="field activation-field">
+          Activation
+          <div className="activation-picker">
+            {primary.map((a) => (
+              <button
+                key={a.id}
+                type="button"
+                title={a.note}
+                disabled={compare}
+                className={!compare && activation === a.id ? "seg selected" : "seg"}
+                style={
+                  !compare && activation === a.id
+                    ? { borderColor: ACTIVATION_COLORS[a.id], color: ACTIVATION_COLORS[a.id] }
+                    : undefined
+                }
+                onClick={() => update({ activation: a.id })}
+              >
+                {a.label}
+              </button>
+            ))}
+            <select
+              aria-label="More activations"
+              disabled={compare}
+              value={secondary.some((a) => a.id === activation) ? activation : ""}
+              onChange={(e) => e.target.value && update({ activation: e.target.value as ActivationId })}
+            >
+              <option value="">More…</option>
+              {secondary.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          className={compare ? "compare-toggle on" : "compare-toggle"}
+          onClick={() => update({ compare: !compare })}
+          title="Train Cauchy, ReLU and Tanh together on the same data, seed and optimiser"
+        >
+          Compare activations
+        </button>
+
         <label className="field">
           Learning rate
-          <select
-            value={learningRate}
-            onChange={(event) => update({ learningRate: Number(event.target.value) })}
-          >
+          <select value={learningRate} onChange={(e) => update({ learningRate: Number(e.target.value) })}>
             {LEARNING_RATES.map((rate) => (
               <option key={rate} value={rate}>
                 {rate}
@@ -234,26 +391,10 @@ export default function Playground() {
         </label>
 
         <label className="field">
-          Activation
-          <select
-            value={activation}
-            onChange={(event) => update({ activation: event.target.value as Activation })}
-          >
-            {ACTIVATIONS.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="field">
           Regularization
           <select
             value={regularization}
-            onChange={(event) =>
-              update({ regularization: event.target.value as Regularization })
-            }
+            onChange={(e) => update({ regularization: e.target.value as Regularization })}
           >
             <option value="none">None</option>
             <option value="l1">L1</option>
@@ -266,7 +407,7 @@ export default function Playground() {
           <select
             value={regRate}
             disabled={regularization === "none"}
-            onChange={(event) => update({ regRate: Number(event.target.value) })}
+            onChange={(e) => update({ regRate: Number(e.target.value) })}
           >
             {REG_RATES.map((rate) => (
               <option key={rate} value={rate}>
@@ -280,51 +421,57 @@ export default function Playground() {
       <main className="playground">
         <section className="column" aria-label="Data">
           <h2>Data</h2>
-          <p className="column-note">Which target should the network fit?</p>
           <div className="target-grid">
             {TARGETS.map((item) => (
               <button
                 key={item.id}
                 type="button"
-                className={`target-chip ${target === item.id ? "selected" : ""}`}
+                className={`target-chip ${target === item.id ? "selected" : ""} ${item.featured ? "featured" : ""}`}
                 onClick={() => update({ target: item.id })}
                 title={item.note}
               >
                 <svg viewBox="0 0 60 34" aria-hidden="true">
                   <polyline
-                    points={PLOT_XS.filter((_, i) => i % 4 === 0)
+                    points={PLOT_XS.filter((_, i) => i % 2 === 0)
                       .map((x, i, arr) => {
                         const y = targetValue(item.id, x);
-                        return `${((i / (arr.length - 1)) * 56 + 2).toFixed(1)},${(17 - y * 12).toFixed(1)}`;
+                        const mid = item.id === "step" || item.id === "runge" ? 24 : 17;
+                        return `${((i / (arr.length - 1)) * 56 + 2).toFixed(1)},${(mid - y * 12).toFixed(1)}`;
                       })
                       .join(" ")}
                   />
                 </svg>
                 <span>{item.label}</span>
+                {item.featured && <em className="chip-badge">XNet</em>}
               </button>
             ))}
           </div>
 
+          <div className="noise-row">
+            <span>Noise</span>
+            <div className="segmented">
+              {NOISE_LEVELS.map((level) => (
+                <button
+                  key={level}
+                  type="button"
+                  className={noise === level ? "seg selected" : "seg"}
+                  onClick={() => update({ noise: level })}
+                >
+                  {level.toFixed(2)}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <label className="slider">
-            Ratio of training to test data: <strong>{percentTrain}%</strong>
+            Train / test split: <strong>{percentTrain}%</strong>
             <input
               type="range"
               min="10"
               max="90"
               step="10"
               value={percentTrain}
-              onChange={(event) => update({ percentTrain: Number(event.target.value) })}
-            />
-          </label>
-          <label className="slider">
-            Noise: <strong>{noise.toFixed(2)}</strong>
-            <input
-              type="range"
-              min="0"
-              max="0.5"
-              step="0.05"
-              value={noise}
-              onChange={(event) => update({ noise: Number(event.target.value) })}
+              onChange={(e) => update({ percentTrain: Number(e.target.value) })}
             />
           </label>
           <label className="slider">
@@ -335,7 +482,7 @@ export default function Playground() {
               max={BATCH_SIZES.length - 1}
               step="1"
               value={BATCH_SIZES.indexOf(batchSize)}
-              onChange={(event) => update({ batchSize: BATCH_SIZES[Number(event.target.value)] })}
+              onChange={(e) => update({ batchSize: BATCH_SIZES[Number(e.target.value)] })}
             />
           </label>
           <button
@@ -345,89 +492,225 @@ export default function Playground() {
           >
             Regenerate
           </button>
+
+          <h2 className="spaced">Activation shape</h2>
+          <ActivationShapeChart
+            activation={compare ? "cauchy" : activation}
+            params={shapeParams}
+            showDerivative={showDerivative}
+            caption={compare ? "Cauchy (initial)" : activationMeta(activation).note}
+          />
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={showDerivative}
+              onChange={(e) => setConfig({ ...config, showDerivative: e.target.checked })}
+            />
+            Show φ′(z)
+          </label>
+
+          {cauchyVisible && (
+            <div className="cauchy-params">
+              <span className="formula">φ(x) = (λ₁x + λ₂) / (x² + d²)</span>
+              <ParamSlider
+                label="λ₁"
+                value={config.l1}
+                min={-2}
+                max={2}
+                step={0.05}
+                onChange={(v) => update({ l1: v })}
+              />
+              <ParamSlider
+                label="λ₂"
+                value={config.l2}
+                min={-2}
+                max={2}
+                step={0.05}
+                onChange={(v) => update({ l2: v })}
+              />
+              <ParamSlider
+                label="d"
+                value={config.d}
+                min={0.1}
+                max={2}
+                step={0.05}
+                onChange={(v) => update({ d: v })}
+              />
+              <small>Initial values — training adapts them per neuron.</small>
+            </div>
+          )}
         </section>
 
         <section className="column column-network" aria-label="Network">
           <h2>Network</h2>
-          <NetworkDiagram
-            net={net}
-            activation={activation}
-            hovered={hovered}
-            onHover={setHovered}
-            onAddLayer={() =>
-              hiddenCount < MAX_LAYERS && update({ shape: [...shape, 3] })
-            }
-            onRemoveLayer={() => hiddenCount > 0 && update({ shape: shape.slice(0, -1) })}
-            onAddNeuron={(layer) => {
-              if (shape[layer] >= MAX_NEURONS) return;
-              const next = [...shape];
-              next[layer] += 1;
-              update({ shape: next });
-            }}
-            onRemoveNeuron={(layer) => {
-              if (shape[layer] <= 1) return;
-              const next = [...shape];
-              next[layer] -= 1;
-              update({ shape: next });
-            }}
-          />
+          {compare && (
+            <div className="segmented run-tabs">
+              {runs.map((run) => (
+                <button
+                  key={run.activation}
+                  type="button"
+                  className={focusActivation === run.activation ? "seg selected" : "seg"}
+                  style={
+                    focusActivation === run.activation
+                      ? { borderColor: ACTIVATION_COLORS[run.activation], color: ACTIVATION_COLORS[run.activation] }
+                      : undefined
+                  }
+                  onClick={() => {
+                    setFocusActivation(run.activation);
+                    setSelected(null);
+                  }}
+                >
+                  {activationMeta(run.activation).label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {focusRun && (
+            <NetworkDiagram
+              net={focusRun.net}
+              activation={focusRun.activation}
+              hovered={hovered}
+              selected={selected}
+              onHover={setHovered}
+              onSelect={setSelected}
+              onAddLayer={() => shape.length < MAX_LAYERS && update({ shape: [...shape, 3] })}
+              onRemoveLayer={() => shape.length > 0 && update({ shape: shape.slice(0, -1) })}
+              onAddNeuron={(layer) => {
+                if (shape[layer] >= MAX_NEURONS) return;
+                const next = [...shape];
+                next[layer] += 1;
+                update({ shape: next });
+              }}
+              onRemoveNeuron={(layer) => {
+                if (shape[layer] <= 1) return;
+                const next = [...shape];
+                next[layer] -= 1;
+                update({ shape: next });
+              }}
+            />
+          )}
+
+          {focusRun && focusNeuron && contribution ? (
+            <NeuronInspector
+              net={focusRun.net}
+              activation={focusRun.activation}
+              ref_={focusNeuron}
+              contribution={contribution}
+              showDerivative={showDerivative}
+              pinned={selected !== null && hovered === null}
+            />
+          ) : (
+            <p className="network-hint">
+              Each box plots that neuron&rsquo;s own output across x. Thickness is weight
+              magnitude; <span className="swatch-pos">orange</span> positive,{" "}
+              <span className="swatch-neg">blue</span> negative. Hover a neuron for detail,
+              click to pin it.
+            </p>
+          )}
         </section>
 
         <section className="column column-output" aria-label="Output">
           <h2>Output</h2>
-          <div className="loss-readout">
-            <div>
-              <span>Test loss</span>
-              <strong className="loss-test-value">{testLoss.toFixed(4)}</strong>
-            </div>
-            <div>
-              <span>Training loss</span>
-              <strong className="loss-train-value">{trainLoss.toFixed(4)}</strong>
-            </div>
-          </div>
-          <LossChart history={history} />
+          <MetricsPanel rows={metrics} errorTarget={errorTarget} />
 
+          <div className="output-controls">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={showTest}
+                onChange={(e) => setConfig({ ...config, showTest: e.target.checked })}
+              />
+              Show test data
+            </label>
+            <label className="checkbox">
+              Target error
+              <select
+                value={errorTarget}
+                onChange={(e) => setConfig({ ...config, errorTarget: Number(e.target.value) })}
+              >
+                {ERROR_TARGETS.map((t) => (
+                  <option key={t} value={t}>
+                    {t.toExponential(0)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <LossChart series={lossSeries} />
           <ApproximationPlot
-            net={net}
-            activation={activation}
+            runs={plotRuns}
             target={target}
             train={dataset.train}
             test={dataset.test}
             showTest={showTest}
-            hoveredCurve={hoveredCurve}
+            overlay={contribution ? { delta: contribution.delta, band: contribution.band } : null}
           />
-
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={showTest}
-              onChange={(event) => setConfig((c) => ({ ...c, showTest: event.target.checked }))}
-            />
-            Show test data
-          </label>
         </section>
       </main>
 
-      <footer className="formula-strip">
-        <div>
-          <span>Neuron input</span>
-          <strong>z = wᵀa + b</strong>
-        </div>
-        <div>
-          <span>Cauchy activation</span>
-          <strong>φ(z) = (λ₁z + λ₂)/(z² + σ²)</strong>
-        </div>
-        <div>
-          <span>Learned per neuron</span>
-          <strong>{activation === "cauchy" ? "w, b, λ₁, λ₂, σ" : "w, b only"}</strong>
-        </div>
-        <div>
-          <span>Network</span>
-          <strong>
-            {networkShape(net).join(" → ") || "no hidden layer"} → 1
-          </strong>
-        </div>
-      </footer>
+      <PaperBenchmarks />
     </div>
+  );
+}
+
+function Masthead({ mode, onMode }: { mode: "fit" | "pde"; onMode: (m: "fit" | "pde") => void }) {
+  return (
+    <header className="masthead">
+      <div className="masthead-text">
+        <p className="eyebrow">Cauchy activation playground</p>
+        <h1>
+          Watch a network learn the <em>shape</em> of its own nonlinearity.
+        </h1>
+      </div>
+      <div className="mode-switch">
+        <button
+          type="button"
+          className={mode === "fit" ? "selected" : ""}
+          onClick={() => onMode("fit")}
+        >
+          Function Approximation
+        </button>
+        <button
+          type="button"
+          className={mode === "pde" ? "selected" : ""}
+          onClick={() => onMode("pde")}
+        >
+          PDE Demo
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function ParamSlider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="param-slider">
+      <span>{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <strong>{value.toFixed(2)}</strong>
+    </label>
   );
 }

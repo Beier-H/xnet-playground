@@ -1,13 +1,26 @@
 // Core model for the Cauchy activation playground.
 //
 // A small fully-connected network on a 1-D input, trained with mini-batch SGD.
-// Every hidden unit carries its own Cauchy shape parameters (l1, l2, sigma), so
-// under the "cauchy" activation the network learns the *shape* of its
-// nonlinearity as well as its weights. ReLU and tanh ignore those parameters,
-// which is what makes the three settings comparable.
+// Under the "cauchy" activation every hidden unit also carries its own shape
+// parameters (λ₁, λ₂, d), so the network learns the shape of its nonlinearity
+// as well as its weights. Every other activation has a fixed shape, which is
+// the comparison the playground exists to make visible.
 
-export type Activation = "cauchy" | "relu" | "tanh";
-export type TargetId = "sin" | "exp" | "abs" | "step";
+import {
+  ACTIVATION_IDS,
+  D_FLOOR,
+  dPhi,
+  phi,
+  shapeGradient,
+  sigmoid,
+  softplus,
+  activationMeta,
+  type ActivationId,
+  type ShapeParams,
+} from "./activations";
+
+export type { ActivationId, ShapeParams } from "./activations";
+export type TargetId = "step" | "sin" | "highsin" | "runge" | "abs" | "exp";
 export type Regularization = "none" | "l1" | "l2";
 
 export const X_MIN = -1;
@@ -16,42 +29,56 @@ export const X_MAX = 1;
 /** Shared x grid for the approximation plot and the hovered-neuron overlay. */
 export const PLOT_XS = Array.from({ length: 97 }, (_, i) => X_MIN + (i * (X_MAX - X_MIN)) / 96);
 
-/** Smallest half-width a Cauchy unit may take, so the denominator never vanishes. */
-const SIGMA_FLOOR = 0.08;
+/** Denser grid used only for measuring true approximation error. */
+const ERROR_XS = Array.from({ length: 401 }, (_, i) => X_MIN + (i * (X_MAX - X_MIN)) / 400);
+
 /** Per-parameter gradient clip. Rational activations can spike; this keeps SGD sane. */
 const GRAD_CLIP = 8;
 const PARAM_CLIP = 60;
 
-export const ACTIVATIONS: { id: Activation; label: string }[] = [
-  { id: "cauchy", label: "Cauchy" },
-  { id: "relu", label: "ReLU" },
-  { id: "tanh", label: "Tanh" },
-];
-
-export const TARGETS: { id: TargetId; label: string; note: string }[] = [
-  { id: "sin", label: "sin(πx)", note: "smooth, analytic" },
-  { id: "exp", label: "eˣ⁄e", note: "smooth, monotone" },
-  { id: "abs", label: "|x|", note: "kink at x = 0" },
-  { id: "step", label: "step(x)", note: "discontinuous" },
-];
-
 export const LEARNING_RATES = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3];
 export const REG_RATES = [0, 0.001, 0.003, 0.01, 0.03, 0.1];
 export const BATCH_SIZES = [1, 2, 5, 10, 20, 30];
+/** Noise levels are discrete so a comparison can be repeated exactly. */
+export const NOISE_LEVELS = [0, 0.05, 0.1, 0.2];
+export const ERROR_TARGETS = [1e-2, 1e-3, 1e-4];
 
 export const MAX_LAYERS = 4;
 export const MAX_NEURONS = 8;
 
+/** The three activations pitted against each other in Compare mode. */
+export const COMPARE_SET: ActivationId[] = ["cauchy", "relu", "tanh"];
+
+export const TARGETS: {
+  id: TargetId;
+  label: string;
+  note: string;
+  /** Flagged in the UI as the headline XNet benchmark. */
+  featured?: boolean;
+}[] = [
+  { id: "step", label: "step(x)", note: "Heaviside — discontinuous", featured: true },
+  { id: "sin", label: "sin(πx)", note: "smooth, analytic" },
+  { id: "highsin", label: "sin(10πx)", note: "high frequency" },
+  { id: "runge", label: "Runge", note: "1/(1+25x²) — sharp peak" },
+  { id: "abs", label: "|x|", note: "kink at x = 0" },
+  { id: "exp", label: "eˣ⁄e", note: "smooth, monotone" },
+];
+
 export function targetValue(target: TargetId, x: number): number {
   switch (target) {
+    case "step":
+      // Heaviside, the discontinuous benchmark from the XNet work.
+      return x < 0 ? 0 : 1;
     case "sin":
       return Math.sin(Math.PI * x);
-    case "exp":
-      return Math.exp(x) / Math.E;
+    case "highsin":
+      return Math.sin(10 * Math.PI * x);
+    case "runge":
+      return 1 / (1 + 25 * x * x);
     case "abs":
       return Math.abs(x);
-    case "step":
-      return x < 0 ? -0.6 : 0.6;
+    case "exp":
+      return Math.exp(x) / Math.E;
   }
 }
 
@@ -78,7 +105,7 @@ function gaussian(rng: () => number): number {
 export type Point = { x: number; y: number };
 export type Dataset = { train: Point[]; test: Point[] };
 
-const POINT_COUNT = 120;
+const POINT_COUNT = 160;
 
 export function makeDataset(
   target: TargetId,
@@ -107,34 +134,37 @@ export type Neuron = {
   /** Incoming weights, one per unit in the previous layer. */
   w: number[];
   b: number;
-  /** Cauchy shape parameters. Unused by ReLU and tanh. */
+  /** Cauchy shape parameters. Ignored by every fixed-shape activation. */
   l1: number;
   l2: number;
-  /** Pre-softplus half-width; the effective sigma is `sigmaOf(neuron)`. */
-  sRaw: number;
+  /** Pre-softplus half-width; the effective d is `shapeOf(neuron).d`. */
+  dRaw: number;
 };
 
 /** Hidden layers followed by a single linear output neuron. */
 export type Network = Neuron[][];
 
-export function sigmaOf(n: Neuron): number {
-  return softplus(n.sRaw) + SIGMA_FLOOR;
+export function shapeOf(n: Neuron): ShapeParams {
+  return { l1: n.l1, l2: n.l2, d: softplus(n.dRaw) + D_FLOOR };
 }
 
-function softplus(x: number): number {
-  return x > 18 ? x : Math.log1p(Math.exp(x));
-}
-
-function sigmoid(x: number): number {
-  return 1 / (1 + Math.exp(-x));
+/** Inverse of `softplus(dRaw) + D_FLOOR`, for seeding d from a UI control. */
+function dToRaw(d: number): number {
+  const above = Math.max(1e-3, d - D_FLOOR);
+  return Math.log(Math.expm1(above) + 1e-12);
 }
 
 /** `shape` lists hidden layer widths; the output neuron is appended here. */
-export function buildNetwork(shape: number[], seed: number): Network {
+export function buildNetwork(
+  shape: number[],
+  seed: number,
+  init: ShapeParams = { l1: 1, l2: 0, d: 0.5 },
+): Network {
   const rng = mulberry32(seed);
   const widths = [...shape, 1];
   const net: Network = [];
   let fanIn = 1;
+  const baseDRaw = dToRaw(init.d);
 
   for (const width of widths) {
     const layer: Neuron[] = [];
@@ -144,9 +174,10 @@ export function buildNetwork(shape: number[], seed: number): Network {
       layer.push({
         w: Array.from({ length: fanIn }, () => (rng() * 2 - 1) * spread),
         b: (rng() * 2 - 1) * 0.6,
-        l1: (rng() * 2 - 1) * 0.5,
-        l2: (rng() * 2 - 1) * 0.5,
-        sRaw: -0.2 + (rng() * 2 - 1) * 0.3,
+        // Jitter around the configured shape so units can specialise.
+        l1: init.l1 + (rng() * 2 - 1) * 0.25,
+        l2: init.l2 + (rng() * 2 - 1) * 0.25,
+        dRaw: baseDRaw + (rng() * 2 - 1) * 0.25,
       });
     }
     net.push(layer);
@@ -159,24 +190,34 @@ export function networkShape(net: Network): number[] {
   return net.slice(0, -1).map((layer) => layer.length);
 }
 
+/** Trainable parameter count, including shape parameters where they exist. */
+export function parameterCount(shape: number[], activation: ActivationId): number {
+  const extra = activationMeta(activation).shapeParams;
+  let fanIn = 1;
+  let total = 0;
+  for (const width of shape) {
+    total += width * (fanIn + 1 + extra);
+    fanIn = width;
+  }
+  total += fanIn + 1; // linear output neuron
+  return total;
+}
+
 function cloneNetwork(net: Network): Network {
   return net.map((layer) => layer.map((n) => ({ ...n, w: [...n.w] })));
 }
 
 // ------------------------------------------------------------ forward / loss
 
-function activate(n: Neuron, z: number, act: Activation): number {
-  if (act === "relu") return Math.max(0, z);
-  if (act === "tanh") return Math.tanh(z);
-  const s = sigmaOf(n);
-  return (n.l1 * z + n.l2) / (z * z + s * s);
-}
+type Override = { layer: number; index: number; value: number };
 
 /**
  * Runs the network and keeps every intermediate value.
  * `acts[0]` is the input; `acts[l + 1]` is the output of layer `l`.
+ * An `override` pins one hidden unit's output, which is how contribution is
+ * measured by ablation.
  */
-function forward(net: Network, x: number, act: Activation) {
+function forward(net: Network, x: number, act: ActivationId, override?: Override) {
   const acts: number[][] = [[x]];
   const zs: number[][] = [[]];
 
@@ -185,13 +226,15 @@ function forward(net: Network, x: number, act: Activation) {
     const isOutput = l === net.length - 1;
     const z: number[] = [];
     const a: number[] = [];
-    for (const n of layer) {
+    layer.forEach((n, j) => {
       let sum = n.b;
       for (let i = 0; i < prev.length; i += 1) sum += n.w[i] * prev[i];
       z.push(sum);
       // The output neuron stays linear so the network can span any range.
-      a.push(isOutput ? sum : activate(n, sum, act));
-    }
+      let value = isOutput ? sum : phi(act, sum, shapeOf(n));
+      if (override && override.layer === l && override.index === j) value = override.value;
+      a.push(value);
+    });
     zs.push(z);
     acts.push(a);
   });
@@ -199,12 +242,12 @@ function forward(net: Network, x: number, act: Activation) {
   return { acts, zs };
 }
 
-export function predict(net: Network, x: number, act: Activation): number {
+export function predict(net: Network, x: number, act: ActivationId): number {
   const { acts } = forward(net, x, act);
   return acts[acts.length - 1][0];
 }
 
-export function loss(net: Network, points: Point[], act: Activation): number {
+export function loss(net: Network, points: Point[], act: ActivationId): number {
   if (points.length === 0) return 0;
   let total = 0;
   for (const p of points) {
@@ -215,13 +258,29 @@ export function loss(net: Network, points: Point[], act: Activation): number {
 }
 
 /**
+ * Squared error against the *noiseless* target on a dense grid.
+ *
+ * Distinct from training loss, which is measured on finitely many noisy
+ * samples: this is the quantity that actually says how well the function was
+ * approximated, and it is the one that exposes overfitting to noise.
+ */
+export function functionMse(net: Network, act: ActivationId, target: TargetId): number {
+  let total = 0;
+  for (const x of ERROR_XS) {
+    const err = predict(net, x, act) - targetValue(target, x);
+    total += err * err;
+  }
+  return total / ERROR_XS.length;
+}
+
+/**
  * Output of every hidden neuron across `xs`, indexed `[layer][neuron][sample]`.
  * Drives the per-neuron thumbnails in the network diagram.
  */
 export function neuronCurves(
   net: Network,
   xs: number[],
-  act: Activation,
+  act: ActivationId,
 ): number[][][] {
   const hiddenCount = net.length - 1;
   const curves: number[][][] = Array.from({ length: hiddenCount }, (_, l) =>
@@ -236,21 +295,69 @@ export function neuronCurves(
   return curves;
 }
 
+export type Contribution = {
+  /** Own output of the neuron across `xs`. */
+  own: number[];
+  /** Change in network output when this neuron is pinned to its mean. */
+  delta: number[];
+  /** x-range where |delta| is at least half its peak. */
+  band: { lo: number; hi: number } | null;
+  peak: number;
+};
+
+/**
+ * How much one neuron actually matters, measured by ablation: pin its output to
+ * its own mean and see how far the network's output moves. This works for a
+ * neuron in any layer, unlike simply reading its outgoing weight.
+ */
+export function neuronContribution(
+  net: Network,
+  xs: number[],
+  act: ActivationId,
+  layer: number,
+  index: number,
+): Contribution {
+  const own = xs.map((x) => forward(net, x, act).acts[layer + 1][index]);
+  const mean = own.reduce((s, v) => s + v, 0) / (own.length || 1);
+
+  const delta = xs.map((x, i) => {
+    const full = forward(net, x, act).acts[net.length][0];
+    const ablated = forward(net, x, act, { layer, index, value: mean }).acts[net.length][0];
+    void i;
+    return full - ablated;
+  });
+
+  const abs = delta.map(Math.abs);
+  const peak = Math.max(...abs);
+  let band: { lo: number; hi: number } | null = null;
+  if (peak > 1e-9) {
+    // Contiguous run around the peak where influence stays above half.
+    const centre = abs.indexOf(peak);
+    let lo = centre;
+    let hi = centre;
+    while (lo > 0 && abs[lo - 1] >= peak * 0.5) lo -= 1;
+    while (hi < abs.length - 1 && abs[hi + 1] >= peak * 0.5) hi += 1;
+    band = { lo: xs[lo], hi: xs[hi] };
+  }
+
+  return { own, delta, band, peak };
+}
+
 // ------------------------------------------------------------------ training
 
 export type TrainOptions = {
-  activation: Activation;
+  activation: ActivationId;
   learningRate: number;
   batchSize: number;
   regularization: Regularization;
   regRate: number;
 };
 
-type Grad = { w: number[]; b: number; l1: number; l2: number; sRaw: number };
+type Grad = { w: number[]; b: number; l1: number; l2: number; dRaw: number };
 
 function zeroGrads(net: Network): Grad[][] {
   return net.map((layer) =>
-    layer.map((n) => ({ w: new Array(n.w.length).fill(0), b: 0, l1: 0, l2: 0, sRaw: 0 })),
+    layer.map((n) => ({ w: new Array(n.w.length).fill(0), b: 0, l1: 0, l2: 0, dRaw: 0 })),
   );
 }
 
@@ -258,7 +365,7 @@ function backprop(
   net: Network,
   grads: Grad[][],
   point: Point,
-  act: Activation,
+  act: ActivationId,
   scale: number,
 ) {
   const { acts, zs } = forward(net, point.x, act);
@@ -274,29 +381,21 @@ function backprop(
 
     net[l].forEach((n, j) => {
       const z = zs[l + 1][j];
-      const a = acts[l + 1][j];
       const g = grads[l][j];
       let dZ: number;
 
       if (isOutput) {
         dZ = dA[j]; // linear output neuron
       } else {
-        let dPhi: number;
-        if (act === "relu") {
-          dPhi = z > 0 ? 1 : 0;
-        } else if (act === "tanh") {
-          dPhi = 1 - a * a;
-        } else {
-          const s = sigmaOf(n);
-          const den = z * z + s * s;
-          const num = n.l1 * z + n.l2;
-          dPhi = (n.l1 * den - 2 * z * num) / (den * den);
-          // The shape parameters only exist on the Cauchy path.
-          g.l1 += (dA[j] * z) / den;
-          g.l2 += dA[j] / den;
-          g.sRaw += dA[j] * ((-2 * s * num) / (den * den)) * sigmoid(n.sRaw);
+        const params = shapeOf(n);
+        dZ = dA[j] * dPhi(act, z, params);
+        if (act === "cauchy") {
+          const sg = shapeGradient(act, z, params);
+          g.l1 += dA[j] * sg.l1;
+          g.l2 += dA[j] * sg.l2;
+          // Chain through d = softplus(dRaw) + floor.
+          g.dRaw += dA[j] * sg.d * sigmoid(n.dRaw);
         }
-        dZ = dA[j] * dPhi;
       }
 
       g.b += dZ;
@@ -327,21 +426,32 @@ function regGradient(w: number, reg: Regularization, rate: number): number {
   return 0;
 }
 
-/** One pass over the training set in mini-batches. Returns a new network. */
-export function trainEpoch(
-  net: Network,
-  train: Point[],
-  opts: TrainOptions,
-  rng: () => number,
-): Network {
-  if (train.length === 0) return net;
-
-  const next = cloneNetwork(net);
-  const order = train.map((_, i) => i);
+/** A shuffled visiting order. Shared across runs so a comparison is exact. */
+export function shuffledOrder(count: number, rng: () => number): number[] {
+  const order = Array.from({ length: count }, (_, i) => i);
   for (let i = order.length - 1; i > 0; i -= 1) {
     const j = Math.floor(rng() * (i + 1));
     [order[i], order[j]] = [order[j], order[i]];
   }
+  return order;
+}
+
+/**
+ * One pass over the training set in mini-batches. Returns a new network.
+ *
+ * `order` is supplied by the caller rather than drawn here so that Compare mode
+ * can hand every activation the identical sequence of mini-batches.
+ */
+export function trainEpoch(
+  net: Network,
+  train: Point[],
+  opts: TrainOptions,
+  order: number[],
+): Network {
+  if (train.length === 0) return net;
+
+  const next = cloneNetwork(net);
+  const isCauchy = opts.activation === "cauchy";
 
   for (let start = 0; start < order.length; start += opts.batchSize) {
     const batch = order.slice(start, start + opts.batchSize);
@@ -354,14 +464,15 @@ export function trainEpoch(
       layer.forEach((n, j) => {
         const g = grads[l][j];
         for (let i = 0; i < n.w.length; i += 1) {
-          const step = clip(g.w[i], GRAD_CLIP) + regGradient(n.w[i], opts.regularization, opts.regRate);
+          const step =
+            clip(g.w[i], GRAD_CLIP) + regGradient(n.w[i], opts.regularization, opts.regRate);
           n.w[i] = settle(n.w[i] - lr * step, n.w[i]);
         }
         n.b = settle(n.b - lr * clip(g.b, GRAD_CLIP), n.b);
-        if (opts.activation === "cauchy") {
+        if (isCauchy) {
           n.l1 = settle(n.l1 - lr * clip(g.l1, GRAD_CLIP), n.l1);
           n.l2 = settle(n.l2 - lr * clip(g.l2, GRAD_CLIP), n.l2);
-          n.sRaw = settle(n.sRaw - lr * clip(g.sRaw, GRAD_CLIP), n.sRaw, 6);
+          n.dRaw = settle(n.dRaw - lr * clip(g.dRaw, GRAD_CLIP), n.dRaw, 6);
         }
       });
     });
@@ -369,3 +480,5 @@ export function trainEpoch(
 
   return next;
 }
+
+export { ACTIVATION_IDS };

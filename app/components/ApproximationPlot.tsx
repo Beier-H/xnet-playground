@@ -2,11 +2,11 @@
 
 import { useMemo } from "react";
 
+import type { ActivationId } from "../lib/activations";
 import {
   PLOT_XS,
   predict,
   targetValue,
-  type Activation,
   type Network,
   type Point,
   type TargetId,
@@ -16,29 +16,30 @@ import {
 const round = (value: number) => Math.round(value * 10) / 10;
 
 const WIDTH = 720;
-const HEIGHT = 340;
+const HEIGHT = 320;
 const PAD = { left: 46, right: 18, top: 16, bottom: 34 };
 const SAMPLES = PLOT_XS;
 const X_TICKS = [-1, -0.5, 0, 0.5, 1];
 
+export type PlotRun = { activation: ActivationId; net: Network; color: string };
+
 type Props = {
-  net: Network;
-  activation: Activation;
+  runs: PlotRun[];
   target: TargetId;
   train: Point[];
   test: Point[];
   showTest: boolean;
-  hoveredCurve: number[] | null;
+  /** Selected neuron's influence on the output, plus where it matters most. */
+  overlay: { delta: number[]; band: { lo: number; hi: number } | null } | null;
 };
 
 export default function ApproximationPlot({
-  net,
-  activation,
+  runs,
   target,
   train,
   test,
   showTest,
-  hoveredCurve,
+  overlay,
 }: Props) {
   // The vertical range deliberately ignores the model: a diverging network would
   // otherwise rescale the axes every frame and make the plot unreadable.
@@ -65,9 +66,7 @@ export default function ApproximationPlot({
       .map((v, i) => `${i === 0 ? "M" : "L"}${toX(SAMPLES[i]).toFixed(1)},${toY(v).toFixed(1)}`)
       .join(" ");
 
-  // Everything below is independent of the network, so it is built once per
-  // dataset instead of on every training frame. Stable element identity lets
-  // React bail out of diffing these subtrees entirely.
+  // Independent of the network, so built once per dataset rather than per frame.
   const axes = useMemo(() => {
     const yTicks = [low, (low + high) / 2, high];
     return (
@@ -98,11 +97,11 @@ export default function ApproximationPlot({
     () => (
       <g>
         {train.map((p, i) => (
-          <circle key={`tr-${i}`} cx={round(toX(p.x))} cy={round(toY(p.y))} r="3" className="point-train" />
+          <circle key={`tr-${i}`} cx={round(toX(p.x))} cy={round(toY(p.y))} r="2.6" className="point-train" />
         ))}
         {showTest &&
           test.map((p, i) => (
-            <circle key={`te-${i}`} cx={round(toX(p.x))} cy={round(toY(p.y))} r="3.4" className="point-test" />
+            <circle key={`te-${i}`} cx={round(toX(p.x))} cy={round(toY(p.y))} r="3" className="point-test" />
           ))}
       </g>
     ),
@@ -116,34 +115,33 @@ export default function ApproximationPlot({
     [target, low, high],
   );
 
-  const modelPath = path(SAMPLES.map((x) => predict(net, x, activation)));
-
   return (
     <svg
       className="plot"
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       role="img"
-      aria-label="Target function, sampled data, and network prediction"
+      aria-label="Target function, samples, and network predictions"
     >
       <rect x="0" y="0" width={WIDTH} height={HEIGHT} rx="12" className="plot-background" />
+
+      {/* Where the selected neuron does most of its work. */}
+      {overlay?.band && (
+        <rect
+          x={round(toX(overlay.band.lo))}
+          y={PAD.top}
+          width={Math.max(2, round(toX(overlay.band.hi) - toX(overlay.band.lo)))}
+          height={HEIGHT - PAD.top - PAD.bottom}
+          className="influence-band"
+        />
+      )}
+
       {axes}
       {scatter}
       <path d={targetPath} className="target-line" />
-      {hoveredCurve && <path d={path(hoveredCurve)} className="neuron-line" />}
-      <path d={modelPath} className="model-line" />
-
-      <g transform={`translate(${WIDTH - 170},26)`}>
-        <line x1="0" x2="24" y1="0" y2="0" className="target-line" />
-        <text x="32" y="4" className="legend-label">target</text>
-        <line x1="0" x2="24" y1="19" y2="19" className="model-line" />
-        <text x="32" y="23" className="legend-label">network</text>
-        {hoveredCurve && (
-          <>
-            <line x1="0" x2="24" y1="38" y2="38" className="neuron-line" />
-            <text x="32" y="42" className="legend-label">neuron</text>
-          </>
-        )}
-      </g>
+      {overlay && <path d={path(overlay.delta)} className="neuron-line" />}
+      {runs.map((run) => (
+        <path key={run.activation} d={path(SAMPLES.map((x) => predict(run.net, x, run.activation)))} style={{ stroke: run.color }} className="model-line" />
+      ))}
     </svg>
   );
 }
