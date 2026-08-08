@@ -41,3 +41,7 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# A clone of this repo made inside itself (see README quick start: run it
+# from a directory *outside* the project, not from within it).
+/xnet-playground/
