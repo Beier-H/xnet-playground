@@ -7,6 +7,8 @@ export type RunMetrics = {
   trainLoss: number;
   testLoss: number;
   functionMse: number;
+  /** Error restricted to |x| ≤ 0.15; only meaningful for the step target. */
+  localMse: number;
   epochsToTarget: number | null;
   runtimeMs: number;
   params: number;
@@ -25,9 +27,12 @@ function fmt(value: number): string {
 export default function MetricsPanel({
   rows,
   errorTarget,
+  showLocal,
 }: {
   rows: RunMetrics[];
   errorTarget: number;
+  /** Adds the near-discontinuity column; only shown for the step target. */
+  showLocal: boolean;
 }) {
   const multi = rows.length > 1;
   // Lowest function MSE wins; only marked when there is something to compare.
@@ -37,6 +42,10 @@ export default function MetricsPanel({
 
   return (
     <div className="metrics">
+      <div className="metrics-head">
+        <span className="badge live">Live Result</span>
+        <span className="muted">computed in this browser</span>
+      </div>
       <table>
         <thead>
           <tr>
@@ -46,6 +55,11 @@ export default function MetricsPanel({
             <th title="Squared error against the true noiseless target on a dense grid">
               Fn MSE
             </th>
+            {showLocal && (
+              <th title="Squared error restricted to |x| ≤ 0.15, around the discontinuity">
+                Local MSE
+              </th>
+            )}
             <th title={`First epoch where Fn MSE ≤ ${errorTarget}`}>
               Ep→{errorTarget.toExponential(0)}
             </th>
@@ -63,6 +77,7 @@ export default function MetricsPanel({
               <td>{fmt(r.trainLoss)}</td>
               <td>{fmt(r.testLoss)}</td>
               <td className="emph">{fmt(r.functionMse)}</td>
+              {showLocal && <td className="emph">{fmt(r.localMse)}</td>}
               <td>{r.epochsToTarget === null ? "—" : r.epochsToTarget.toLocaleString()}</td>
               <td>{(r.runtimeMs / 1000).toFixed(1)}s</td>
               <td>{r.params}</td>

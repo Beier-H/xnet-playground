@@ -179,6 +179,8 @@ export default function NetworkDiagram({
                 onMouseLeave={() => onHover(null)}
                 onClick={() => onSelect(isPinned ? null : { layer: l, index: j })}
                 className="node-group"
+                // Everything but the neuron under inspection recedes.
+                opacity={focus !== null && !isFocus ? 0.3 : 1}
               >
                 <rect
                   x={cx - NODE / 2}

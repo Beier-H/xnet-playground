@@ -331,6 +331,51 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
 .pde-table { max-width: 560px; }
 .pde-note { margin: 0; max-width: 720px; color: var(--muted); font-size: 0.74rem; line-height: 1.5; }
 
+/* ------------------------------------------------- live / paper result badges */
+
+.badge {
+  padding: 2px 7px; border-radius: 5px;
+  font-size: 0.62rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.badge.live { background: #e4f1f9; color: var(--blue-dark); }
+.badge.paper { background: #eef3f7; color: var(--muted); }
+.badge.localized { background: rgba(245, 147, 34, 0.16); color: #a2600f; }
+.badge.discontinuity { background: rgba(245, 147, 34, 0.16); color: #a2600f; }
+
+.metrics-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 0.74rem; }
+.localization-row { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+
+.localization-band { fill: rgba(245, 147, 34, 0.18); }
+.localization-center { stroke: var(--orange); stroke-width: 1.4; stroke-dasharray: 4 3; }
+.localization-label { fill: #a2600f; font-size: 11px; font-weight: 700; }
+
+/* ----------------------------------------------------- neuron efficiency sweep */
+
+.bench-body { display: grid; gap: 14px; padding: 20px 32px 26px; }
+.bench-status { display: flex; align-items: center; gap: 8px; font-size: 0.76rem; }
+.play-button.wide { width: 46px; height: 46px; font-size: 1rem; }
+
+.bench-progress { height: 5px; border-radius: 3px; background: #e8eef3; overflow: hidden; }
+.bench-progress .bar { height: 100%; background: var(--blue); transition: width 0.15s linear; }
+
+.bench-chart { display: grid; gap: 4px; max-width: 760px; }
+.bench-chart svg { width: 100%; height: auto; display: block; }
+
+.bench-table { width: 100%; max-width: 760px; border-collapse: collapse; font-size: 0.76rem; }
+.bench-table th {
+  padding: 5px 6px; text-align: right; white-space: nowrap;
+  color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line);
+}
+.bench-table th:first-child, .bench-table th:nth-child(2) { text-align: left; }
+.bench-table td {
+  padding: 5px 6px; text-align: right;
+  border-bottom: 1px solid #f0f4f7; font-variant-numeric: tabular-nums;
+}
+.bench-table td:first-child, .bench-table td:nth-child(2) { text-align: left; white-space: nowrap; }
+.bench-table td.emph { font-weight: 700; color: var(--ink); }
+
 /* ---------------------------------------------------------- paper benchmarks */
 
 .paper-panel { margin: 0 32px 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
@@ -340,16 +385,17 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
   background: transparent; border: 0; color: var(--ink);
   font-size: 0.82rem; text-align: left;
 }
-.paper-badge {
-  padding: 2px 7px; border-radius: 5px;
-  background: #eef3f7; color: var(--muted);
-  font-size: 0.64rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-}
 .paper-count { margin-left: auto; color: var(--muted); font-size: 0.74rem; }
 .chevron { color: var(--muted); }
 .paper-body { padding: 0 16px 14px; }
-.paper-body .empty { color: #a9b6c4; font-style: italic; }
+.paper-group { margin-top: 14px; }
+.paper-group-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; margin-bottom: 4px; }
+.paper-group-head strong { font-size: 0.84rem; }
+.paper-group-head cite { color: var(--muted); font-size: 0.72rem; font-style: italic; }
+.paper-body tr.xnet td { background: rgba(245, 147, 34, 0.07); }
+.mono { font-family: var(--font-geist-mono), ui-monospace, monospace; font-size: 0.72rem; }
 .paper-note { margin: 8px 0 0; color: var(--muted); font-size: 0.72rem; line-height: 1.55; }
+.paper-note.strong { color: var(--ink); }
 .paper-note code { background: #eef3f7; padding: 1px 4px; border-radius: 4px; }
 
 /* --------------------------------------------------------------- responsive */

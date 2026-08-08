@@ -49,11 +49,12 @@ Other commands:
 | `npm run build` | Production build |
 | `npm run lint` | ESLint |
 
-## Two modes
+## Three modes
 
-**Function Approximation** fits a 1-D target. **PDE Demo** solves a small
-PINN problem. Both compare Cauchy against fixed-shape activations under
-identical conditions.
+**Function Approximation** fits a 1-D target. **Neuron Efficiency** sweeps
+network width and plots test MSE against neuron count. **PDE Demo** solves a
+small PINN problem. All three compare Cauchy against fixed-shape activations
+under identical conditions.
 
 ## What you can do
 
@@ -74,7 +75,15 @@ identical conditions.
   parameter count.
 - **Inspect a neuron** — hover or click to pin one and see its learned λ₁, λ₂,
   d, its own response curve, its contribution to the output (measured by
-  ablation), and the x-band where it matters most.
+  ablation), and the x-band where it matters most. For Cauchy units the
+  effective centre μ and width are derived from the existing parameters and
+  drawn as a localization band; every other neuron dims.
+- **Sweep width** — Neuron Efficiency trains widths 8→256 for Cauchy, ReLU and
+  Tanh and plots test MSE against neuron count on a log axis, to test whether
+  Cauchy reaches a target error with fewer neurons.
+- **Zoom the discontinuity** — with step(x) selected you get a zoomed inset over
+  x ∈ [−0.15, 0.15] and a Local MSE column measured only in that window, where
+  a global MSE would be swamped by the two flat halves.
 - **Change the problem** — six targets including the Heaviside step (the XNet
   benchmark), sin(10πx) and the Runge function; discrete noise levels 0 / 0.05
   / 0.10 / 0.20; train/test split; batch size; L1 or L2 regularization.
@@ -97,12 +106,19 @@ analytic gradients for the Cauchy shape parameters. Every derivative is
 verified against central differences (φ′ to ~5e-7, φ″ to ~4e-6, full backprop
 to ~9e-8 relative).
 
-## Paper benchmarks
+## Live Result vs Paper Result
 
-`app/lib/paperBenchmarks.ts` is **intentionally empty**. The panel renders each
-row as "not supplied" until real reported figures are added, because populating
-a "Paper Result" table with invented numbers would be a fabricated citation.
-Add the values and a citation there and the panel fills in.
+Every number in the interface carries one of two labels and they are never
+mixed:
+
+- **Live Result** — computed in your browser, right now, by this code.
+- **Paper Result** — quoted from published work, in `app/lib/paperBenchmarks.ts`,
+  with its source, task, architecture, metric and reported value.
+
+They are not comparable. The papers train much larger networks, for longer, with
+different optimisers, so a paper MSE of 1e-8 next to a live MSE of 1e-3 says
+nothing about this implementation. Where a paper did not report a quantity the
+cell is blank rather than estimated.
 
 ## The PDE demo is a prototype
 

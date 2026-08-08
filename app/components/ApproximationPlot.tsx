@@ -30,7 +30,12 @@ type Props = {
   test: Point[];
   showTest: boolean;
   /** Selected neuron's influence on the output, plus where it matters most. */
-  overlay: { delta: number[]; band: { lo: number; hi: number } | null } | null;
+  overlay: {
+    delta: number[];
+    band: { lo: number; hi: number } | null;
+    /** Cauchy only: analytic centre μ and half-width d in input space. */
+    localization: { mu: number; width: number } | null;
+  } | null;
 };
 
 export default function ApproximationPlot({
@@ -124,7 +129,7 @@ export default function ApproximationPlot({
     >
       <rect x="0" y="0" width={WIDTH} height={HEIGHT} rx="12" className="plot-background" />
 
-      {/* Where the selected neuron does most of its work. */}
+      {/* Where the selected neuron does most of its work, measured by ablation. */}
       {overlay?.band && (
         <rect
           x={round(toX(overlay.band.lo))}
@@ -135,13 +140,54 @@ export default function ApproximationPlot({
         />
       )}
 
+      {/* Analytic Cauchy localisation: centre μ and half-width d in input space. */}
+      {overlay?.localization && (
+        <g>
+          <rect
+            x={round(toX(overlay.localization.mu - overlay.localization.width))}
+            y={PAD.top}
+            width={Math.max(
+              2,
+              round(
+                toX(overlay.localization.mu + overlay.localization.width) -
+                  toX(overlay.localization.mu - overlay.localization.width),
+              ),
+            )}
+            height={HEIGHT - PAD.top - PAD.bottom}
+            className="localization-band"
+          />
+          <line
+            x1={round(toX(overlay.localization.mu))}
+            x2={round(toX(overlay.localization.mu))}
+            y1={PAD.top}
+            y2={HEIGHT - PAD.bottom}
+            className="localization-center"
+          />
+          <text
+            x={round(toX(overlay.localization.mu))}
+            y={PAD.top + 12}
+            textAnchor="middle"
+            className="localization-label"
+          >
+            μ
+          </text>
+        </g>
+      )}
+
       {axes}
       {scatter}
       <path d={targetPath} className="target-line" />
-      {overlay && <path d={path(overlay.delta)} className="neuron-line" />}
+      {/* While a neuron is under inspection the fits recede so its own
+          contribution curve is readable against them. */}
       {runs.map((run) => (
-        <path key={run.activation} d={path(SAMPLES.map((x) => predict(run.net, x, run.activation)))} style={{ stroke: run.color }} className="model-line" />
+        <path
+          key={run.activation}
+          d={path(SAMPLES.map((x) => predict(run.net, x, run.activation)))}
+          style={{ stroke: run.color, opacity: overlay ? 0.28 : 1 }}
+          className="model-line"
+        />
       ))}
+      {overlay && <path d={path(overlay.delta)} className="neuron-line" />}
     </svg>
   );
 }

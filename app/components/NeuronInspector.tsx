@@ -3,13 +3,14 @@
 import ActivationShapeChart from "./ActivationShapeChart";
 import type { NeuronRef } from "./NetworkDiagram";
 import { activationMeta, type ActivationId } from "../lib/activations";
-import { shapeOf, type Contribution, type Network } from "../lib/model";
+import { shapeOf, type Contribution, type Localization, type Network } from "../lib/model";
 
 type Props = {
   net: Network;
   activation: ActivationId;
   ref_: NeuronRef;
   contribution: Contribution;
+  localization: Localization | null;
   showDerivative: boolean;
   pinned: boolean;
 };
@@ -23,6 +24,7 @@ export default function NeuronInspector({
   activation,
   ref_,
   contribution,
+  localization,
   showDerivative,
   pinned,
 }: Props) {
@@ -48,6 +50,14 @@ export default function NeuronInspector({
         showDerivative={showDerivative}
         caption="this neuron"
       />
+
+      {localization && (
+        <div className="localization-row">
+          <span className="badge localized">Localized response</span>
+          <span className="chip cauchy">μ {localization.mu.toFixed(3)}</span>
+          <span className="chip cauchy">width {localization.width.toFixed(3)}</span>
+        </div>
+      )}
 
       <div className="param-chips">
         {isCauchy ? (

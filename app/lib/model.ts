@@ -46,6 +46,12 @@ export const ERROR_TARGETS = [1e-2, 1e-3, 1e-4];
 export const MAX_LAYERS = 4;
 export const MAX_NEURONS = 8;
 
+/** Widths swept by the Neuron Efficiency benchmark. */
+export const BENCHMARK_WIDTHS = [8, 16, 32, 64, 128, 256];
+export const BENCHMARK_EPOCHS = [100, 200, 400];
+/** Half-width of the window used for the discontinuity metric. */
+export const LOCAL_RADIUS = 0.15;
+
 /** The three activations pitted against each other in Compare mode. */
 export const COMPARE_SET: ActivationId[] = ["cauchy", "relu", "tanh"];
 
@@ -274,6 +280,70 @@ export function functionMse(net: Network, act: ActivationId, target: TargetId): 
 }
 
 /**
+ * Squared error against the target restricted to |x| ≤ radius.
+ *
+ * The headline number for the Heaviside benchmark: a global MSE is dominated by
+ * the two flat halves, where every activation does fine, and hides what happens
+ * at the jump — which is the only interesting part.
+ */
+export function localMse(
+  net: Network,
+  act: ActivationId,
+  target: TargetId,
+  radius = LOCAL_RADIUS,
+): number {
+  const N = 121;
+  let total = 0;
+  for (let i = 0; i < N; i += 1) {
+    const x = -radius + (2 * radius * i) / (N - 1);
+    const err = predict(net, x, act) - targetValue(target, x);
+    total += err * err;
+  }
+  return total / N;
+}
+
+export type Localization = { mu: number; width: number };
+
+/**
+ * Where a Cauchy neuron sits and how wide it is, in input space.
+ *
+ * With z = w·x + b the activation can be rewritten
+ *   φ(z) ∝ [λ₁w(x − μ) + λ₂] / [(x − μ)² + (d/|w|)²],  μ = −b/w
+ * so the centre and width are already implied by the existing parameters — no
+ * extra ones are introduced. The crossing is located numerically so that this
+ * also works for neurons in deeper layers, where z is no longer linear in x;
+ * there it is a local linearisation around the point where z vanishes.
+ */
+export function effectiveLocalization(
+  net: Network,
+  xs: number[],
+  act: ActivationId,
+  layer: number,
+  index: number,
+): Localization | null {
+  if (act !== "cauchy") return null;
+  const neuron = net[layer]?.[index];
+  if (!neuron) return null;
+
+  const zs = xs.map((x) => forward(net, x, act).zs[layer + 1][index]);
+  let best = 0;
+  for (let i = 1; i < zs.length; i += 1) {
+    if (Math.abs(zs[i]) < Math.abs(zs[best])) best = i;
+  }
+
+  const lo = Math.max(0, best - 1);
+  const hi = Math.min(zs.length - 1, best + 1);
+  const slope = (zs[hi] - zs[lo]) / (xs[hi] - xs[lo]);
+  if (!Number.isFinite(slope) || Math.abs(slope) < 1e-9) return null;
+
+  // Linear estimate of the crossing; exact for a first-layer neuron.
+  const mu = xs[best] - zs[best] / slope;
+  const width = shapeOf(neuron).d / Math.abs(slope);
+  if (!Number.isFinite(mu) || !Number.isFinite(width)) return null;
+  return { mu, width };
+}
+
+/**
  * Output of every hidden neuron across `xs`, indexed `[layer][neuron][sample]`.
  * Drives the per-neuron thumbnails in the network diagram.
  */
@@ -480,5 +550,130 @@ export function trainEpoch(
 
   return next;
 }
+
+// ------------------------------------------------- neuron efficiency benchmark
+
+export type BenchmarkResult = {
+  width: number;
+  activation: ActivationId;
+  trainMse: number;
+  testMse: number;
+  functionMse: number;
+  epochsToTarget: number | null;
+  runtimeMs: number;
+  params: number;
+};
+
+export type BenchmarkJob = BenchmarkResult & {
+  net: Network;
+  epochsDone: number;
+  done: boolean;
+};
+
+/**
+ * One shuffled order per epoch, generated once and shared by every job.
+ *
+ * This is what makes the sweep a fair test: each activation at each width sees
+ * not merely the same data and seed but the identical sequence of mini-batches,
+ * so the only thing varying is the activation.
+ */
+export function makeEpochOrders(epochs: number, trainSize: number, seed: number): number[][] {
+  const rng = mulberry32(seed);
+  return Array.from({ length: epochs }, () => shuffledOrder(trainSize, rng));
+}
+
+export function createBenchmarkJobs(
+  widths: number[],
+  activations: ActivationId[],
+  netSeed: number,
+  init: ShapeParams,
+): BenchmarkJob[] {
+  const jobs: BenchmarkJob[] = [];
+  for (const width of widths) {
+    for (const activation of activations) {
+      jobs.push({
+        width,
+        activation,
+        // Same width, same seed, same initial shape for every activation.
+        net: buildNetwork([width], netSeed, init),
+        epochsDone: 0,
+        done: false,
+        trainMse: NaN,
+        testMse: NaN,
+        functionMse: NaN,
+        epochsToTarget: null,
+        runtimeMs: 0,
+        params: parameterCount([width], activation),
+      });
+    }
+  }
+  return jobs;
+}
+
+/** How often the true approximation error is sampled while sweeping. */
+const PROBE_EVERY = 5;
+
+/**
+ * Runs at most `slice` more epochs of one job and returns its updated state.
+ *
+ * Deliberately incremental: the caller yields to the browser between slices so
+ * a 256-neuron sweep cannot freeze the page.
+ */
+export function advanceBenchmarkJob(
+  job: BenchmarkJob,
+  dataset: Dataset,
+  target: TargetId,
+  opts: Omit<TrainOptions, "activation">,
+  orders: number[][],
+  maxEpochs: number,
+  errorTarget: number,
+  /**
+   * Wall-clock budget for this slice. A fixed epoch count is the wrong unit:
+   * one epoch at 256 neurons costs roughly 30× one at 8, so a flat slice that
+   * feels instant at the small end drops frames at the large end.
+   */
+  budgetMs = 16,
+): BenchmarkJob {
+  if (job.done) return job;
+
+  const budget = orders.length;
+  const limit = Math.min(budget, job.epochsDone + maxEpochs);
+  let net = job.net;
+  let epochsToTarget = job.epochsToTarget;
+  let epoch = job.epochsDone;
+  const started = performance.now();
+
+  for (; epoch < limit; epoch += 1) {
+    net = trainEpoch(net, dataset.train, { ...opts, activation: job.activation }, orders[epoch]);
+    if (epochsToTarget === null && (epoch + 1) % PROBE_EVERY === 0) {
+      if (functionMse(net, job.activation, target) <= errorTarget) epochsToTarget = epoch + 1;
+    }
+    // Always complete at least one epoch, then yield as soon as the budget is up.
+    if (performance.now() - started >= budgetMs) {
+      epoch += 1;
+      break;
+    }
+  }
+
+  const until = epoch;
+  const elapsed = performance.now() - started;
+  const done = until >= budget;
+
+  return {
+    ...job,
+    net,
+    epochsDone: until,
+    done,
+    epochsToTarget,
+    runtimeMs: job.runtimeMs + elapsed,
+    // Final metrics are only meaningful once a job finishes, but computing them
+    // per slice keeps the table alive while the sweep runs.
+    trainMse: computeMse(net, dataset.train, job.activation),
+    testMse: computeMse(net, dataset.test, job.activation),
+    functionMse: functionMse(net, job.activation, target),
+  };
+}
+
+const computeMse = loss;
 
 export { ACTIVATION_IDS };

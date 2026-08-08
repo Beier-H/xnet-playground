@@ -10,6 +10,8 @@ import NetworkDiagram, { type NeuronRef } from "./components/NetworkDiagram";
 import NeuronInspector from "./components/NeuronInspector";
 import PaperBenchmarks from "./components/PaperBenchmarks";
 import PdeDemo from "./components/PdeDemo";
+import DiscontinuityInset from "./components/DiscontinuityInset";
+import WidthBenchmark from "./components/WidthBenchmark";
 import {
   ACTIVATIONS,
   ACTIVATION_COLORS,
@@ -28,7 +30,9 @@ import {
   REG_RATES,
   TARGETS,
   buildNetwork,
+  effectiveLocalization,
   functionMse,
+  localMse,
   loss as computeLoss,
   makeDataset,
   mulberry32,
@@ -40,7 +44,13 @@ import {
   type Network,
   type Regularization,
 } from "./lib/model";
-import { DEFAULT_CONFIG, readConfig, writeConfig, type PlaygroundConfig } from "./lib/urlState";
+import {
+  DEFAULT_CONFIG,
+  readConfig,
+  writeConfig,
+  type Mode,
+  type PlaygroundConfig,
+} from "./lib/urlState";
 
 /**
  * Config keys that invalidate whatever has been trained so far. Learning rate,
@@ -241,11 +251,26 @@ export default function Playground() {
     );
   }, [focusNeuron, focusRun]);
 
+  const localization = useMemo(() => {
+    if (!focusNeuron || !focusRun) return null;
+    if (focusNeuron.layer >= focusRun.net.length - 1) return null;
+    return effectiveLocalization(
+      focusRun.net,
+      PLOT_XS,
+      focusRun.activation,
+      focusNeuron.layer,
+      focusNeuron.index,
+    );
+  }, [focusNeuron, focusRun]);
+
+  const isStep = target === "step";
+
   const metrics: RunMetrics[] = runs.map((run) => ({
     activation: run.activation,
     trainLoss: computeLoss(run.net, dataset.train, run.activation),
     testLoss: computeLoss(run.net, dataset.test, run.activation),
     functionMse: functionMse(run.net, run.activation, target),
+    localMse: localMse(run.net, run.activation, target),
     epochsToTarget: run.epochsToTarget,
     runtimeMs: run.runtimeMs,
     params: parameterCount(shape, run.activation),
@@ -276,6 +301,30 @@ export default function Playground() {
   const secondary = ACTIVATIONS.filter((a) => !a.primary);
   const cauchyVisible = compare || activation === "cauchy";
   const shapeParams = { l1: config.l1, l2: config.l2, d: config.d };
+
+  if (mode === "width") {
+    return (
+      <div className="page">
+        <Masthead mode={mode} onMode={(m) => update({ mode: m })} />
+        <WidthBenchmark
+          target={target}
+          learningRate={learningRate}
+          batchSize={batchSize}
+          regularization={regularization}
+          regRate={regRate}
+          noise={noise}
+          percentTrain={percentTrain}
+          dataSeed={dataSeed}
+          netSeed={config.netSeed}
+          errorTarget={errorTarget}
+          init={shapeParams}
+          onLearningRate={(lr) => setConfig({ ...config, learningRate: lr })}
+          onErrorTarget={(v) => setConfig({ ...config, errorTarget: v })}
+        />
+        <PaperBenchmarks />
+      </div>
+    );
+  }
 
   if (mode === "pde") {
     return (
@@ -597,6 +646,7 @@ export default function Playground() {
               activation={focusRun.activation}
               ref_={focusNeuron}
               contribution={contribution}
+              localization={localization}
               showDerivative={showDerivative}
               pinned={selected !== null && hovered === null}
             />
@@ -612,7 +662,13 @@ export default function Playground() {
 
         <section className="column column-output" aria-label="Output">
           <h2>Output</h2>
-          <MetricsPanel rows={metrics} errorTarget={errorTarget} />
+          {isStep && (
+            <div className="bench-status">
+              <span className="badge discontinuity">Discontinuity Benchmark</span>
+              <span className="muted">Heaviside — the XNet reference task</span>
+            </div>
+          )}
+          <MetricsPanel rows={metrics} errorTarget={errorTarget} showLocal={isStep} />
 
           <div className="output-controls">
             <label className="checkbox">
@@ -645,8 +701,13 @@ export default function Playground() {
             train={dataset.train}
             test={dataset.test}
             showTest={showTest}
-            overlay={contribution ? { delta: contribution.delta, band: contribution.band } : null}
+            overlay={
+              contribution
+                ? { delta: contribution.delta, band: contribution.band, localization }
+                : null
+            }
           />
+          {isStep && <DiscontinuityInset runs={plotRuns} target={target} />}
         </section>
       </main>
 
@@ -655,7 +716,13 @@ export default function Playground() {
   );
 }
 
-function Masthead({ mode, onMode }: { mode: "fit" | "pde"; onMode: (m: "fit" | "pde") => void }) {
+const MODES: { id: Mode; label: string }[] = [
+  { id: "fit", label: "Function Approximation" },
+  { id: "width", label: "Neuron Efficiency" },
+  { id: "pde", label: "PDE Demo" },
+];
+
+function Masthead({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
   return (
     <header className="masthead">
       <div className="masthead-text">
@@ -665,20 +732,16 @@ function Masthead({ mode, onMode }: { mode: "fit" | "pde"; onMode: (m: "fit" | "
         </h1>
       </div>
       <div className="mode-switch">
-        <button
-          type="button"
-          className={mode === "fit" ? "selected" : ""}
-          onClick={() => onMode("fit")}
-        >
-          Function Approximation
-        </button>
-        <button
-          type="button"
-          className={mode === "pde" ? "selected" : ""}
-          onClick={() => onMode("pde")}
-        >
-          PDE Demo
-        </button>
+        {MODES.map((m) => (
+          <button
+            key={m.id}
+            type="button"
+            className={mode === m.id ? "selected" : ""}
+            onClick={() => onMode(m.id)}
+          >
+            {m.label}
+          </button>
+        ))}
       </div>
     </header>
   );

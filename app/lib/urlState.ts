@@ -17,7 +17,7 @@ import {
 } from "./model";
 import { PDES, type PdeId } from "./pde";
 
-export type Mode = "fit" | "pde";
+export type Mode = "fit" | "pde" | "width";
 
 export type PlaygroundConfig = {
   mode: Mode;
@@ -100,7 +100,7 @@ export function readConfig(hash: string): PlaygroundConfig {
   const params = new URLSearchParams(hash.replace(/^#/, ""));
   const d = DEFAULT_CONFIG;
   return {
-    mode: pickFrom(params.get("mode"), ["fit", "pde"] as const, d.mode),
+    mode: pickFrom(params.get("mode"), ["fit", "pde", "width"] as const, d.mode),
     compare: params.get("compare") === "true",
     activation: pickFrom(params.get("activation"), ACTIVATION_IDS as ActivationId[], d.activation),
     target: pickFrom(params.get("target"), TARGETS.map((t) => t.id), d.target),
