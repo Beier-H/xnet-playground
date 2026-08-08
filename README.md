@@ -17,6 +17,10 @@ activations so the difference is visible rather than asserted.
 
 Requires **Node.js 22.13 or newer** (`node -v` to check).
 
+Run this from an empty directory, **not** from inside an existing copy of the
+project — cloning into itself leaves a stale nested copy that will happily serve
+an older version of the app on a different port.
+
 ```bash
 git clone https://github.com/Beier-H/xnet-playground.git
 cd xnet-playground
