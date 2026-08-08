@@ -134,27 +134,24 @@ Heaviside step, while Tanh wins on Poisson with fewer parameters.
 
 ## Platform notes
 
-Built from the `vinext-starter` template, so a few files belong to the
+Built from the `vinext-starter` template, so a couple of files belong to the
 [vinext](https://github.com/cloudflare/vinext) hosting stack rather than to the
-playground. None of them affect running it locally.
+playground. Neither affects running it locally.
+
+**There is no authentication.** The playground has no login, no server-side
+identity and no user data — it is entirely client-side. The template's optional
+ChatGPT sign-in helper (`app/chatgpt-auth.ts`) was unused and has been removed.
+If you ever want it back, it read the `oai-authenticated-user-*` request
+headers that OpenAI Sites injects; the platform owns the `/signin-with-chatgpt`,
+`/signout-with-chatgpt` and `/callback` routes, so an app never implements them
+itself.
 
 **`.openai/hosting.json`** — configuration for OpenAI Sites hosting.
 `project_id` ties the repo to a hosting project; `d1` and `r2` would declare a
 Cloudflare D1 database or R2 bucket, and both are `null` here because the
 playground stores nothing. `vite.config.ts` simulates declared bindings during
-local development.
-
-**`app/chatgpt-auth.ts`** — helpers for optional *Dispatch-owned ChatGPT
-sign-in* (SIWC). On OpenAI Sites the platform owns the entire OAuth flow — the
-`/signin-with-chatgpt`, `/signout-with-chatgpt` and `/callback` routes, the
-cookies, the redirects — and injects the signed-in user into each request as
-`oai-authenticated-user-id` and `oai-authenticated-user-email` headers. These
-helpers only read those headers; do not implement those routes yourself.
-
-**The playground imports neither.** It has no login, no server-side identity
-and no user data, and those headers exist only when hosted on that platform.
-Both files are inert here and are kept only so the template stays intact. If
-you deploy somewhere else, they can be deleted.
+local development. Kept because deleting it would unlink the hosting project;
+it is safe to remove if you deploy somewhere else.
 
 `db/schema.ts` is intentionally empty, `examples/d1/` is an unused optional
 sample, and this starter does not use `wrangler.jsonc`.
