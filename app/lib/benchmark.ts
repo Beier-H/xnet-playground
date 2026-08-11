@@ -8,6 +8,7 @@ import { ACTIVATION_COLORS, activationMeta, type ActivationId } from "./activati
 import {
   buildKan,
   kanFunctionMse,
+  kanLocalMse,
   kanLoss,
   kanParameterCount,
   kanPredict,
@@ -16,7 +17,9 @@ import {
 } from "./kan";
 import {
   buildNetwork,
+  LOCAL_RADIUS,
   functionMse,
+  localMse,
   loss,
   mulberry32,
   parameterCount,
@@ -214,4 +217,78 @@ export function advanceBenchmarkJob(
     testMse: jobLoss(state, dataset.test, job.model),
     functionMse: jobFunctionMse(state, job.model, target),
   };
+}
+
+// ------------------------------------------------- shared model dispatch layer
+//
+// The main Compare view needs the same "either family" handling as the sweep.
+// Exported here so page.tsx does not grow a second copy of the dispatch.
+
+export type ModelState = JobState;
+
+/**
+ * KAN is single-hidden-layer by construction, so it takes the first hidden
+ * width when the MLPs are given a deeper shape. The diagram and the parameter
+ * column both show the real size, so the difference stays visible.
+ */
+export function kanWidthFor(shape: number[]): number {
+  return Math.max(1, shape[0] ?? 1);
+}
+
+export function buildModelState(
+  model: ModelId,
+  shape: number[],
+  seed: number,
+  init: ShapeParams,
+): ModelState {
+  return model === "kan"
+    ? { kind: "kan", net: buildKan(kanWidthFor(shape), seed) }
+    : { kind: "mlp", net: buildNetwork(shape, seed, init) };
+}
+
+export function trainModelEpoch(
+  state: ModelState,
+  model: ModelId,
+  train: Dataset["train"],
+  opts: TrainOptions,
+  order: number[],
+): ModelState {
+  if (state.kind === "kan") {
+    return {
+      kind: "kan",
+      net: kanTrainEpoch(
+        state.net,
+        train,
+        { learningRate: opts.learningRate, batchSize: opts.batchSize },
+        order,
+      ),
+    };
+  }
+  return { kind: "mlp", net: trainEpoch(state.net, train, opts, order) };
+}
+
+export function statePredict(state: ModelState, model: ModelId, x: number): number {
+  return state.kind === "kan" ? kanPredict(state.net, x) : predict(state.net, x, model as ActivationId);
+}
+
+export function stateLoss(state: ModelState, model: ModelId, points: Dataset["train"]): number {
+  return state.kind === "kan" ? kanLoss(state.net, points) : loss(state.net, points, model as ActivationId);
+}
+
+export function stateFunctionMse(state: ModelState, model: ModelId, target: TargetId): number {
+  return state.kind === "kan"
+    ? kanFunctionMse(state.net, target)
+    : functionMse(state.net, model as ActivationId, target);
+}
+
+export function stateLocalMse(state: ModelState, model: ModelId, target: TargetId): number {
+  return state.kind === "kan"
+    ? kanLocalMse(state.net, target, LOCAL_RADIUS)
+    : localMse(state.net, model as ActivationId, target);
+}
+
+export function stateParams(state: ModelState, model: ModelId, shape: number[]): number {
+  return model === "kan"
+    ? kanParameterCount(kanWidthFor(shape))
+    : parameterCount(shape, model as ActivationId);
 }

@@ -344,3 +344,41 @@ export function kanLocalMse(net: KanNet, target: TargetId, radius: number): numb
 export function kanTestLoss(net: KanNet, data: Dataset): number {
   return kanLoss(net, data.test);
 }
+
+/**
+ * What one hidden path contributes to the output.
+ *
+ * The output is a plain sum of the outer edge functions, so pinning edge `i` to
+ * its own mean shifts F(x) by exactly ψ_i(h_i(x)) − mean(ψ_i). No ablation
+ * re-run is needed — this is the contribution, exactly.
+ */
+export function kanEdgeContribution(
+  net: KanNet,
+  xs: number[],
+  index: number,
+): { own: number[]; delta: number[]; band: { lo: number; hi: number } | null; peak: number } {
+  const own: number[] = [];
+  const psi: number[] = [];
+  for (const x of xs) {
+    const { b: b1 } = basisAndDeriv(x, net.knots1);
+    const h = edgeValue(net.e1[index], x, b1);
+    own.push(h);
+    const { b: b2 } = basisAndDeriv(h, net.knots2);
+    psi.push(edgeValue(net.e2[index], h, b2));
+  }
+  const mean = psi.reduce((s, v) => s + v, 0) / (psi.length || 1);
+  const delta = psi.map((v) => v - mean);
+
+  const abs = delta.map(Math.abs);
+  const peak = Math.max(...abs);
+  let band: { lo: number; hi: number } | null = null;
+  if (peak > 1e-9) {
+    const centre = abs.indexOf(peak);
+    let lo = centre;
+    let hi = centre;
+    while (lo > 0 && abs[lo - 1] >= peak * 0.5) lo -= 1;
+    while (hi < abs.length - 1 && abs[hi + 1] >= peak * 0.5) hi += 1;
+    band = { lo: xs[lo], hi: xs[hi] };
+  }
+  return { own, delta, band, peak };
+}

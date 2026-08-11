@@ -2,15 +2,7 @@
 
 import { useMemo } from "react";
 
-import type { ActivationId } from "../lib/activations";
-import {
-  PLOT_XS,
-  predict,
-  targetValue,
-  type Network,
-  type Point,
-  type TargetId,
-} from "../lib/model";
+import { PLOT_XS, targetValue, type Point, type TargetId } from "../lib/model";
 
 /** Rounds a coordinate to a stable number of decimals for SSR/client agreement. */
 const round = (value: number) => Math.round(value * 10) / 10;
@@ -21,7 +13,9 @@ const PAD = { left: 46, right: 18, top: 16, bottom: 34 };
 const SAMPLES = PLOT_XS;
 const X_TICKS = [-1, -0.5, 0, 0.5, 1];
 
-export type PlotRun = { activation: ActivationId; net: Network; color: string };
+/** A curve to draw. Carrying `predict` keeps the plot independent of which
+ * model family produced it — MLP or KAN. */
+export type PlotRun = { id: string; color: string; predict: (x: number) => number };
 
 type Props = {
   runs: PlotRun[];
@@ -181,8 +175,8 @@ export default function ApproximationPlot({
           contribution curve is readable against them. */}
       {runs.map((run) => (
         <path
-          key={run.activation}
-          d={path(SAMPLES.map((x) => predict(run.net, x, run.activation)))}
+          key={run.id}
+          d={path(SAMPLES.map((x) => run.predict(x)))}
           style={{ stroke: run.color, opacity: overlay ? 0.28 : 1 }}
           className="model-line"
         />

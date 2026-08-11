@@ -412,3 +412,10 @@ input[type="range"] { width: 100%; accent-color: var(--blue); }
   .paper-panel { margin: 0 18px 22px; }
   .pde-charts { grid-template-columns: 1fr; }
 }
+
+/* ------------------------------------------------------------------ KAN view */
+
+.kan-legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 0.72rem; }
+.kan-wire { fill: none; stroke: #c3cedb; stroke-width: 1.4; }
+.kan-node { fill: #fff; stroke: #2b4257; stroke-width: 1.6; }
+.kan-curve { fill: none; stroke: #9333ea; stroke-width: 2; stroke-linejoin: round; pointer-events: none; }

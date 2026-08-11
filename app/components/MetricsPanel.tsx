@@ -1,9 +1,9 @@
 "use client";
 
-import { ACTIVATION_COLORS, activationMeta, type ActivationId } from "../lib/activations";
+import { modelColor, modelLabel, type ModelId } from "../lib/benchmark";
 
 export type RunMetrics = {
-  activation: ActivationId;
+  model: ModelId;
   trainLoss: number;
   testLoss: number;
   functionMse: number;
@@ -37,7 +37,7 @@ export default function MetricsPanel({
   const multi = rows.length > 1;
   // Lowest function MSE wins; only marked when there is something to compare.
   const best = multi
-    ? rows.reduce((a, b) => (b.functionMse < a.functionMse ? b : a)).activation
+    ? rows.reduce((a, b) => (b.functionMse < a.functionMse ? b : a)).model
     : null;
 
   return (
@@ -49,7 +49,7 @@ export default function MetricsPanel({
       <table>
         <thead>
           <tr>
-            <th>{multi ? "Activation" : "Metric"}</th>
+            <th>{multi ? "Model" : "Metric"}</th>
             <th title="Mean squared error on the noisy training samples">Train</th>
             <th title="Mean squared error on the held-out samples">Test</th>
             <th title="Squared error against the true noiseless target on a dense grid">
@@ -69,10 +69,10 @@ export default function MetricsPanel({
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.activation} className={r.activation === best ? "best" : undefined}>
+            <tr key={r.model} className={r.model === best ? "best" : undefined}>
               <td>
-                <span className="dot" style={{ background: ACTIVATION_COLORS[r.activation] }} />
-                {activationMeta(r.activation).label}
+                <span className="dot" style={{ background: modelColor(r.model) }} />
+                {modelLabel(r.model)}
               </td>
               <td>{fmt(r.trainLoss)}</td>
               <td>{fmt(r.testLoss)}</td>

@@ -6,10 +6,26 @@ import ActivationShapeChart from "./components/ActivationShapeChart";
 import ApproximationPlot, { type PlotRun } from "./components/ApproximationPlot";
 import LossChart, { HISTORY_LIMIT, type LossPoint, type LossSeries } from "./components/LossChart";
 import MetricsPanel, { type RunMetrics } from "./components/MetricsPanel";
+import KanDiagram, { type EdgeRef } from "./components/KanDiagram";
 import NetworkDiagram, { type NeuronRef } from "./components/NetworkDiagram";
 import NeuronInspector from "./components/NeuronInspector";
 import PaperBenchmarks from "./components/PaperBenchmarks";
 import PdeDemo from "./components/PdeDemo";
+import {
+  buildModelState,
+  kanWidthFor,
+  modelColor,
+  modelLabel,
+  stateFunctionMse,
+  stateLocalMse,
+  stateLoss,
+  stateParams,
+  statePredict,
+  trainModelEpoch,
+  type ModelId,
+  type ModelState,
+} from "./lib/benchmark";
+import { kanEdgeContribution } from "./lib/kan";
 import DiscontinuityInset from "./components/DiscontinuityInset";
 import WidthBenchmark from "./components/WidthBenchmark";
 import {
@@ -29,19 +45,12 @@ import {
   PLOT_XS,
   REG_RATES,
   TARGETS,
-  buildNetwork,
   effectiveLocalization,
-  functionMse,
-  localMse,
-  loss as computeLoss,
   makeDataset,
   mulberry32,
   neuronContribution,
-  parameterCount,
   shuffledOrder,
   targetValue,
-  trainEpoch,
-  type Network,
   type Regularization,
 } from "./lib/model";
 import {
@@ -72,26 +81,26 @@ const REBUILD_KEYS = [
 ] as const satisfies readonly (keyof PlaygroundConfig)[];
 
 type Run = {
-  activation: ActivationId;
-  net: Network;
+  model: ModelId;
+  state: ModelState;
   history: LossPoint[];
   epochsToTarget: number | null;
   runtimeMs: number;
 };
 
-function activationsFor(config: PlaygroundConfig): ActivationId[] {
-  return config.compare ? COMPARE_SET : [config.activation];
+/** Compare pits the trainable-shape families against the fixed-shape ones. */
+const COMPARE_MODELS: ModelId[] = [...COMPARE_SET, "kan"];
+
+function modelsFor(config: PlaygroundConfig): ModelId[] {
+  return config.compare ? COMPARE_MODELS : [config.activation];
 }
 
 function buildRuns(config: PlaygroundConfig): Run[] {
-  return activationsFor(config).map((activation) => ({
-    activation,
-    // Identical shape and seed across activations, so a comparison is fair.
-    net: buildNetwork(config.shape, config.netSeed, {
-      l1: config.l1,
-      l2: config.l2,
-      d: config.d,
-    }),
+  const init = { l1: config.l1, l2: config.l2, d: config.d };
+  return modelsFor(config).map((model) => ({
+    model,
+    // Identical shape and seed across models, so a comparison is fair.
+    state: buildModelState(model, config.shape, config.netSeed, init),
     history: [],
     epochsToTarget: null,
     runtimeMs: 0,
@@ -105,7 +114,9 @@ export default function Playground() {
   const [playing, setPlaying] = useState(false);
   const [hovered, setHovered] = useState<NeuronRef | null>(null);
   const [selected, setSelected] = useState<NeuronRef | null>(null);
-  const [focusActivation, setFocusActivation] = useState<ActivationId>("cauchy");
+  const [focusModel, setFocusModel] = useState<ModelId>("cauchy");
+  const [edgeHover, setEdgeHover] = useState<EdgeRef | null>(null);
+  const [edgeSelect, setEdgeSelect] = useState<EdgeRef | null>(null);
 
   const runsRef = useRef(runs);
   useEffect(() => {
@@ -183,11 +194,12 @@ export default function Playground() {
 
     const next = runsRef.current.map((run) => {
       const started = performance.now();
-      const net = trainEpoch(
-        run.net,
+      const state = trainModelEpoch(
+        run.state,
+        run.model,
         dataset.train,
         {
-          activation: run.activation,
+          activation: run.model as ActivationId,
           learningRate,
           batchSize,
           regularization,
@@ -196,18 +208,18 @@ export default function Playground() {
         order,
       );
       const elapsed = performance.now() - started;
-      const fnMse = functionMse(net, run.activation, target);
+      const fnMse = stateFunctionMse(state, run.model, target);
       return {
         ...run,
-        net,
+        state,
         runtimeMs: run.runtimeMs + elapsed,
         epochsToTarget:
           run.epochsToTarget === null && fnMse <= errorTarget ? nextEpoch : run.epochsToTarget,
         history: [
           ...run.history,
           {
-            train: computeLoss(net, dataset.train, run.activation),
-            test: computeLoss(net, dataset.test, run.activation),
+            train: stateLoss(state, run.model, dataset.train),
+            test: stateLoss(state, run.model, dataset.test),
           },
         ].slice(-HISTORY_LIMIT),
       };
@@ -232,67 +244,76 @@ export default function Playground() {
   // ------------------------------------------------------------- derived data
 
   const focusRun = useMemo(
-    () => runs.find((r) => r.activation === focusActivation) ?? runs[0],
-    [runs, focusActivation],
+    () => runs.find((r) => r.model === focusModel) ?? runs[0],
+    [runs, focusModel],
   );
+  const mlpNet = focusRun?.state.kind === "mlp" ? focusRun.state.net : null;
+  const kanNet = focusRun?.state.kind === "kan" ? focusRun.state.net : null;
 
   const focusNeuron = hovered ?? selected;
+  const focusEdge = edgeHover ?? edgeSelect;
 
   const contribution = useMemo(() => {
-    if (!focusNeuron || !focusRun) return null;
-    if (focusNeuron.layer >= focusRun.net.length - 1) return null;
-    if (focusNeuron.index >= focusRun.net[focusNeuron.layer].length) return null;
+    // KAN's output is a plain sum of its outer edge functions, so one edge's
+    // contribution is exact rather than measured by ablation.
+    if (kanNet && focusEdge) {
+      if (focusEdge.index >= kanNet.width) return null;
+      return kanEdgeContribution(kanNet, PLOT_XS, focusEdge.index);
+    }
+    if (!focusNeuron || !mlpNet || !focusRun) return null;
+    if (focusNeuron.layer >= mlpNet.length - 1) return null;
+    if (focusNeuron.index >= mlpNet[focusNeuron.layer].length) return null;
     return neuronContribution(
-      focusRun.net,
+      mlpNet,
       PLOT_XS,
-      focusRun.activation,
+      focusRun.model as ActivationId,
       focusNeuron.layer,
       focusNeuron.index,
     );
-  }, [focusNeuron, focusRun]);
+  }, [focusNeuron, focusEdge, focusRun, mlpNet, kanNet]);
 
   const localization = useMemo(() => {
-    if (!focusNeuron || !focusRun) return null;
-    if (focusNeuron.layer >= focusRun.net.length - 1) return null;
+    if (!focusNeuron || !mlpNet || !focusRun) return null;
+    if (focusNeuron.layer >= mlpNet.length - 1) return null;
     return effectiveLocalization(
-      focusRun.net,
+      mlpNet,
       PLOT_XS,
-      focusRun.activation,
+      focusRun.model as ActivationId,
       focusNeuron.layer,
       focusNeuron.index,
     );
-  }, [focusNeuron, focusRun]);
+  }, [focusNeuron, focusRun, mlpNet]);
 
   const isStep = target === "step";
 
   const metrics: RunMetrics[] = runs.map((run) => ({
-    activation: run.activation,
-    trainLoss: computeLoss(run.net, dataset.train, run.activation),
-    testLoss: computeLoss(run.net, dataset.test, run.activation),
-    functionMse: functionMse(run.net, run.activation, target),
-    localMse: localMse(run.net, run.activation, target),
+    model: run.model,
+    trainLoss: stateLoss(run.state, run.model, dataset.train),
+    testLoss: stateLoss(run.state, run.model, dataset.test),
+    functionMse: stateFunctionMse(run.state, run.model, target),
+    localMse: stateLocalMse(run.state, run.model, target),
     epochsToTarget: run.epochsToTarget,
     runtimeMs: run.runtimeMs,
-    params: parameterCount(shape, run.activation),
+    params: stateParams(run.state, run.model, shape),
   }));
 
   const plotRuns: PlotRun[] = runs.map((run) => ({
-    activation: run.activation,
-    net: run.net,
-    color: ACTIVATION_COLORS[run.activation],
+    id: run.model,
+    color: modelColor(run.model),
+    predict: (x: number) => statePredict(run.state, run.model, x),
   }));
 
   const lossSeries: LossSeries[] = compare
     ? runs.map((run) => ({
-        id: run.activation,
-        color: ACTIVATION_COLORS[run.activation],
+        id: run.model,
+        color: modelColor(run.model),
         values: run.history.map((h) => h.train),
       }))
     : [
         { id: "test", color: "#2b4257", values: runs[0]?.history.map((h) => h.test) ?? [], dashed: true },
         {
           id: "train",
-          color: ACTIVATION_COLORS[runs[0]?.activation ?? "cauchy"],
+          color: modelColor(runs[0]?.model ?? "cauchy"),
           values: runs[0]?.history.map((h) => h.train) ?? [],
         },
       ];
@@ -596,29 +617,40 @@ export default function Playground() {
             <div className="segmented run-tabs">
               {runs.map((run) => (
                 <button
-                  key={run.activation}
+                  key={run.model}
                   type="button"
-                  className={focusActivation === run.activation ? "seg selected" : "seg"}
+                  className={focusModel === run.model ? "seg selected" : "seg"}
                   style={
-                    focusActivation === run.activation
-                      ? { borderColor: ACTIVATION_COLORS[run.activation], color: ACTIVATION_COLORS[run.activation] }
+                    focusModel === run.model
+                      ? { borderColor: modelColor(run.model), color: modelColor(run.model) }
                       : undefined
                   }
                   onClick={() => {
-                    setFocusActivation(run.activation);
+                    setFocusModel(run.model);
                     setSelected(null);
+                    setEdgeSelect(null);
                   }}
                 >
-                  {activationMeta(run.activation).label}
+                  {modelLabel(run.model)}
                 </button>
               ))}
             </div>
           )}
 
-          {focusRun && (
+          {kanNet && (
+            <KanDiagram
+              net={kanNet}
+              hovered={edgeHover}
+              selected={edgeSelect}
+              onHover={setEdgeHover}
+              onSelect={setEdgeSelect}
+            />
+          )}
+
+          {mlpNet && (
             <NetworkDiagram
-              net={focusRun.net}
-              activation={focusRun.activation}
+              net={mlpNet}
+              activation={focusRun.model as ActivationId}
               hovered={hovered}
               selected={selected}
               onHover={setHovered}
@@ -640,16 +672,48 @@ export default function Playground() {
             />
           )}
 
-          {focusRun && focusNeuron && contribution ? (
+          {kanNet && focusEdge && contribution ? (
+            <div className="inspector">
+              <div className="inspector-head">
+                <strong>
+                  {focusEdge.layer === 0 ? "φ" : "ψ"}
+                  <sub>{focusEdge.index + 1}</sub> · {focusEdge.layer === 0 ? "input" : "output"} edge
+                </strong>
+                <span className={edgeSelect ? "pin-badge on" : "pin-badge"}>
+                  {edgeSelect ? "pinned" : "hover"}
+                </span>
+              </div>
+              <div className="param-chips">
+                <span className="chip">{kanNet.e1[0].c.length} spline coefficients</span>
+                <span className="chip">w_b {(focusEdge.layer === 0 ? kanNet.e1 : kanNet.e2)[focusEdge.index].wb.toFixed(2)}</span>
+                <span className="chip">w_s {(focusEdge.layer === 0 ? kanNet.e1 : kanNet.e2)[focusEdge.index].ws.toFixed(2)}</span>
+              </div>
+              <div className="influence">
+                <span>Contribution to output</span>
+                <strong>{contribution.peak.toFixed(3)}</strong>
+                <small>
+                  {contribution.band
+                    ? `strongest on x ∈ [${contribution.band.lo.toFixed(2)}, ${contribution.band.hi.toFixed(2)}]`
+                    : "negligible — this path is not doing much"}
+                </small>
+              </div>
+            </div>
+          ) : mlpNet && focusNeuron && contribution ? (
             <NeuronInspector
-              net={focusRun.net}
-              activation={focusRun.activation}
+              net={mlpNet}
+              activation={focusRun.model as ActivationId}
               ref_={focusNeuron}
               contribution={contribution}
               localization={localization}
               showDerivative={showDerivative}
               pinned={selected !== null && hovered === null}
             />
+          ) : kanNet ? (
+            <p className="network-hint">
+              KAN puts a learnable function on every <em>edge</em>. Each box is one such
+              function; hover for detail, click to pin. Single hidden layer by construction —
+              width {kanWidthFor(shape)} is taken from the first hidden layer.
+            </p>
           ) : (
             <p className="network-hint">
               Each box plots that neuron&rsquo;s own output across x. Thickness is weight

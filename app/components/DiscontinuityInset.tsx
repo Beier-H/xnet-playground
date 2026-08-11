@@ -1,7 +1,7 @@
 "use client";
 
 import type { PlotRun } from "./ApproximationPlot";
-import { LOCAL_RADIUS, predict, targetValue, type TargetId } from "../lib/model";
+import { LOCAL_RADIUS, targetValue, type TargetId } from "../lib/model";
 
 const W = 340;
 const H = 150;
@@ -55,8 +55,8 @@ export default function DiscontinuityInset({
         <path d={path((x) => targetValue(target, x))} className="target-line" />
         {runs.map((run) => (
           <path
-            key={run.activation}
-            d={path((x) => predict(run.net, x, run.activation))}
+            key={run.id}
+            d={path((x) => run.predict(x))}
             style={{ stroke: run.color }}
             className="model-line"
           />
