@@ -2,18 +2,22 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ACTIVATION_COLORS, activationMeta, type ActivationId } from "../lib/activations";
 import {
-  BENCHMARK_EPOCHS,
-  BENCHMARK_WIDTHS,
-  COMPARE_SET,
-  ERROR_TARGETS,
-  LEARNING_RATES,
+  BENCHMARK_SET,
   advanceBenchmarkJob,
   createBenchmarkJobs,
   makeEpochOrders,
-  makeDataset,
+  modelColor,
+  modelLabel,
   type BenchmarkJob,
+  type SweepAxis,
+} from "../lib/benchmark";
+import {
+  BENCHMARK_EPOCHS,
+  BENCHMARK_WIDTHS,
+  ERROR_TARGETS,
+  LEARNING_RATES,
+  makeDataset,
   type Regularization,
   type TargetId,
 } from "../lib/model";
@@ -30,6 +34,11 @@ const Y_MAX = 10;
 const LOG_MIN = Math.log10(Y_MIN);
 const LOG_SPAN = Math.log10(Y_MAX) - LOG_MIN;
 const DECADES = [1, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6];
+
+/** Fixed parameter-axis domain, for the same reason the y axis is fixed. */
+const P_MIN = 10;
+const P_MAX = 10000;
+const P_TICKS = [10, 100, 1000, 10000];
 
 /**
  * Upper bound on epochs per frame; the runner also stops on a wall-clock budget,
@@ -73,6 +82,7 @@ export default function WidthBenchmark(props: Props) {
   const [jobs, setJobs] = useState<BenchmarkJob[]>([]);
   const [running, setRunning] = useState(false);
   const [cursor, setCursor] = useState(0);
+  const [axis, setAxis] = useState<SweepAxis>("width");
 
   const jobsRef = useRef<BenchmarkJob[]>([]);
   const cursorRef = useRef(0);
@@ -86,9 +96,9 @@ export default function WidthBenchmark(props: Props) {
   const start = useCallback(() => {
     const dataset = makeDataset(target, noise, percentTrain, dataSeed);
     datasetRef.current = dataset;
-    // One order per epoch, shared by every width and activation.
+    // One order per epoch, shared by every width and model.
     ordersRef.current = makeEpochOrders(budget, dataset.train.length, 20250808);
-    const fresh = createBenchmarkJobs(BENCHMARK_WIDTHS, COMPARE_SET, netSeed, init);
+    const fresh = createBenchmarkJobs(BENCHMARK_WIDTHS, BENCHMARK_SET, netSeed, init);
     jobsRef.current = fresh;
     cursorRef.current = 0;
     setJobs(fresh);
@@ -145,21 +155,29 @@ export default function WidthBenchmark(props: Props) {
   }, [running, target, learningRate, batchSize, regularization, regRate, errorTarget]);
 
   const widths = BENCHMARK_WIDTHS;
-  const toX = (width: number) =>
+  const byWidth = (width: number) =>
     PAD.left +
     ((Math.log2(width) - Math.log2(widths[0])) /
       (Math.log2(widths[widths.length - 1]) - Math.log2(widths[0]))) *
       (W - PAD.left - PAD.right);
+  const byParams = (params: number) => {
+    const t =
+      (Math.log10(Math.max(P_MIN, params)) - Math.log10(P_MIN)) /
+      (Math.log10(P_MAX) - Math.log10(P_MIN));
+    return PAD.left + Math.max(0, Math.min(1, t)) * (W - PAD.left - PAD.right);
+  };
+  const jobX = (j: BenchmarkJob) => (axis === "width" ? byWidth(j.width) : byParams(j.params));
+
   const toY = (v: number) => {
     if (!Number.isFinite(v) || v <= 0) return PAD.top;
     const t = (Math.log10(v) - LOG_MIN) / LOG_SPAN;
     return PAD.top + (1 - Math.max(0, Math.min(1, t))) * (H - PAD.top - PAD.bottom);
   };
 
-  const seriesFor = (activation: ActivationId) =>
+  const seriesFor = (model: string) =>
     jobs
-      .filter((j) => j.activation === activation && j.done)
-      .sort((a, b) => a.width - b.width);
+      .filter((j) => j.model === model && j.done)
+      .sort((a, b) => (axis === "width" ? a.width - b.width : a.params - b.params));
 
   const hasAny = jobs.some((j) => j.done);
 
@@ -215,11 +233,26 @@ export default function WidthBenchmark(props: Props) {
             ))}
           </select>
         </label>
+        <div className="field">
+          X axis
+          <div className="segmented">
+            {(["width", "params"] as SweepAxis[]).map((a) => (
+              <button
+                key={a}
+                type="button"
+                className={axis === a ? "seg selected" : "seg"}
+                onClick={() => setAxis(a)}
+              >
+                {a === "width" ? "Neurons" : "Parameters"}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="bench-status">
           <span className="badge live">Live Result</span>
           {running && jobs[cursor] && (
             <span className="muted">
-              training {activationMeta(jobs[cursor].activation).label} · width {jobs[cursor].width}
+              training {modelLabel(jobs[cursor].model)} · width {jobs[cursor].width}
             </span>
           )}
         </div>
@@ -232,9 +265,10 @@ export default function WidthBenchmark(props: Props) {
 
         <div className="bench-chart">
           <span className="pde-chart-title">
-            Test MSE vs hidden neurons — identical data, seed, optimiser and batch order
+            Test MSE vs {axis === "width" ? "hidden neurons" : "trainable parameters"} — identical
+            data, seed, optimiser and batch order
           </span>
-          <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Test MSE against network width">
+          <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Test MSE against network size">
             <rect x="0" y="0" width={W} height={H} rx="10" className="plot-background" />
             {DECADES.map((d) => (
               <g key={d}>
@@ -244,44 +278,41 @@ export default function WidthBenchmark(props: Props) {
                 </text>
               </g>
             ))}
-            {widths.map((w) => (
-              <g key={w}>
-                <line
-                  x1={toX(w)}
-                  x2={toX(w)}
-                  y1={PAD.top}
-                  y2={H - PAD.bottom}
-                  className="grid"
-                />
-                <text x={toX(w)} y={H - PAD.bottom + 18} textAnchor="middle" className="axis-label">
-                  {w}
-                </text>
-              </g>
-            ))}
+            {(axis === "width" ? widths : P_TICKS).map((v) => {
+              const x = axis === "width" ? byWidth(v) : byParams(v);
+              return (
+                <g key={v}>
+                  <line x1={x} x2={x} y1={PAD.top} y2={H - PAD.bottom} className="grid" />
+                  <text x={x} y={H - PAD.bottom + 18} textAnchor="middle" className="axis-label">
+                    {v}
+                  </text>
+                </g>
+              );
+            })}
             <text x={W / 2} y={H - 6} textAnchor="middle" className="axis-label">
-              hidden neurons (log₂)
+              {axis === "width" ? "hidden neurons (log₂)" : "trainable parameters (log₁₀)"}
             </text>
 
-            {COMPARE_SET.map((activation) => {
-              const pts = seriesFor(activation);
+            {BENCHMARK_SET.map((model) => {
+              const pts = seriesFor(model);
               if (pts.length === 0) return null;
               return (
-                <g key={activation}>
+                <g key={model}>
                   <path
                     d={pts
-                      .map((p, i) => `${i === 0 ? "M" : "L"}${toX(p.width).toFixed(1)},${toY(p.testMse).toFixed(1)}`)
+                      .map((p, i) => `${i === 0 ? "M" : "L"}${jobX(p).toFixed(1)},${toY(p.testMse).toFixed(1)}`)
                       .join(" ")}
                     fill="none"
-                    stroke={ACTIVATION_COLORS[activation]}
+                    stroke={modelColor(model)}
                     strokeWidth="2.4"
                   />
                   {pts.map((p) => (
                     <circle
                       key={p.width}
-                      cx={toX(p.width)}
+                      cx={jobX(p)}
                       cy={toY(p.testMse)}
                       r="3.4"
-                      fill={ACTIVATION_COLORS[activation]}
+                      fill={modelColor(model)}
                     />
                   ))}
                 </g>
@@ -289,11 +320,11 @@ export default function WidthBenchmark(props: Props) {
             })}
 
             <g transform={`translate(${W - 130},26)`}>
-              {COMPARE_SET.map((a, i) => (
-                <g key={a} transform={`translate(0,${i * 16})`}>
-                  <line x1="0" x2="18" y1="0" y2="0" stroke={ACTIVATION_COLORS[a]} strokeWidth="2.4" />
+              {BENCHMARK_SET.map((m, i) => (
+                <g key={m} transform={`translate(0,${i * 16})`}>
+                  <line x1="0" x2="18" y1="0" y2="0" stroke={modelColor(m)} strokeWidth="2.4" />
                   <text x="24" y="4" className="legend-label">
-                    {activationMeta(a).label}
+                    {modelLabel(m)}
                   </text>
                 </g>
               ))}
@@ -306,7 +337,7 @@ export default function WidthBenchmark(props: Props) {
             <thead>
               <tr>
                 <th>Width</th>
-                <th>Activation</th>
+                <th>Model</th>
                 <th>Train MSE</th>
                 <th>Test MSE</th>
                 <th>Fn MSE</th>
@@ -319,11 +350,11 @@ export default function WidthBenchmark(props: Props) {
               {jobs
                 .filter((j) => j.done)
                 .map((j) => (
-                  <tr key={`${j.width}-${j.activation}`}>
+                  <tr key={`${j.width}-${j.model}`}>
                     <td>{j.width}</td>
                     <td>
-                      <span className="dot" style={{ background: ACTIVATION_COLORS[j.activation] }} />
-                      {activationMeta(j.activation).label}
+                      <span className="dot" style={{ background: modelColor(j.model) }} />
+                      {modelLabel(j.model)}
                     </td>
                     <td>{j.trainMse.toExponential(2)}</td>
                     <td className="emph">{j.testMse.toExponential(2)}</td>
@@ -338,10 +369,16 @@ export default function WidthBenchmark(props: Props) {
         )}
 
         <p className="pde-note">
-          Each width trains a single hidden layer for {budget} epochs. Cauchy carries three
-          extra parameters per neuron, so compare the <em>Params</em> column, not just the
-          width — reaching an error with fewer neurons is not the same as reaching it with
-          fewer parameters.
+          Each width trains a single hidden layer for {budget} epochs. Switch the x axis to{" "}
+          <em>Parameters</em> for the fairer comparison — reaching an error with fewer neurons is
+          not the same as reaching it with fewer parameters, and a KAN edge carries{" "}
+          {2 + 5 + 3} coefficients where a Cauchy neuron carries 3.
+        </p>
+        <p className="pde-note">
+          <strong>KAN here is a minimal implementation</strong> — fixed grid, and the same plain
+          SGD, seed and batch order as everything else. The published KAN adds grid updates,
+          grid extension and LBFGS refinement, none of which are present. Read this line as
+          &ldquo;B-spline edges under identical training&rdquo;, not as the reference KAN.
         </p>
       </div>
     </div>
